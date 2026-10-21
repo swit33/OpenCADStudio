@@ -117,6 +117,265 @@ pub(crate) fn style_for_property<'a>(
     None
 }
 
+/// Rewrite the text of one cell inside the table's baked picture block, in
+/// place: the cell's own authored styling (text style, rotation, height) and
+/// every other cell's text stay exactly as the file drew them.
+///
+/// Editing a cell must not drop the picture block, because rebuilding it from
+/// the cell data re-creates only what the rebuild knows how to reproduce —
+/// the authored per-cell text style and rotation are not part of that, so a
+/// full rebuild flattened every vertical/styled cell in the table.
+///
+/// Returns `false` when the block holds no text for that cell (an empty cell the
+/// picture never drew), so the caller can fall back to a full rebuild.
+pub(crate) fn patch_block_cell_text(
+    document: &mut codec::CadDocument,
+    table_handle: codec::Handle,
+    row: usize,
+    column: usize,
+    value: &str,
+) -> bool {
+    let Some(target) = block_cell_text_target(document, table_handle, row, column) else {
+        return false;
+    };
+    match document.get_entity_mut(target) {
+        Some(codec::EntityType::MText(text)) => {
+            text.value = value.to_string();
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Push a cell's resolved text format onto the baked block's text for that
+/// cell: its text style, height, rotation and content colour.
+///
+/// A format edit has the same problem a content edit has — rebuilding the
+/// picture from the cell data reproduces neither the authored text style nor
+/// the rotation, so the whole table flattened. Writing the resolved format onto
+/// the one text it belongs to shows the change and leaves every other cell as
+/// the file drew it.
+///
+/// `row_style` is the table style's row cell for this row's role, when the
+/// caller has the style object at hand (a table-style edit changes it, not the
+/// cells). Cell, row, column and table-base overrides win over it.
+///
+/// Returns `false` when the block holds no text for that cell.
+pub(crate) fn patch_block_cell_format(
+    document: &mut codec::CadDocument,
+    table_handle: codec::Handle,
+    row: usize,
+    column: usize,
+    row_style: Option<&codec::objects::RowCellStyle>,
+) -> bool {
+    use codec::entities::table::CellStylePropertyFlags as P;
+
+    let table = match document.get_entity(table_handle) {
+        Some(codec::EntityType::Table(table)) => (**table).clone(),
+        _ => return false,
+    };
+    let Some(row_data) = table.rows.get(row) else {
+        return false;
+    };
+    let Some(cell) = row_data.cells.get(column) else {
+        return false;
+    };
+    let content = cell.contents.first();
+    // Text style: the resolved handle names the style to draw with, else the
+    // row cell's own name.
+    let style_name = cell_text_style(document, &table, row_data, column, cell, content)
+        .and_then(|handle| {
+            document
+                .text_styles
+                .iter()
+                .find(|style| style.handle == handle)
+                .map(|style| style.name.clone())
+        })
+        .or_else(|| {
+            style_for_property(&table, row_data, column, cell, P::TEXT_STYLE)
+                .map(|style| style.text_style_name.trim().to_string())
+                .filter(|name| !name.is_empty())
+        })
+        .or_else(|| {
+            row_style
+                .map(|style| style.text_style_name.trim().to_string())
+                .filter(|name| !name.is_empty())
+        });
+    let height = content
+        .and_then(|content| cell_text_height(&table, row_data, column, cell, content))
+        .or_else(|| {
+            style_for_property(&table, row_data, column, cell, P::TEXT_HEIGHT)
+                .map(|style| style.text_height)
+                .filter(|height| *height > 1.0e-6)
+        })
+        .or_else(|| {
+            row_style
+                .map(|style| style.text_height)
+                .filter(|h| *h > 1.0e-6)
+        });
+    let rotation = style_for_property(&table, row_data, column, cell, P::ROTATION)
+        .map(|style| style.rotation)
+        .filter(|rotation| rotation.abs() > 1.0e-12);
+    let color = style_for_property(&table, row_data, column, cell, P::CONTENT_COLOR)
+        .map(|style| style.content_color.clone());
+    let Some(target) = block_cell_text_target(document, table_handle, row, column) else {
+        return false;
+    };
+    match document.get_entity_mut(target) {
+        Some(codec::EntityType::MText(text)) => {
+            if let Some(name) = style_name {
+                text.style = name;
+            }
+            if let Some(height) = height {
+                text.height = height;
+            }
+            if let Some(rotation) = rotation {
+                text.rotation = rotation;
+            }
+            if let Some(color) = color {
+                text.common.color = color;
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+/// The role a row plays in its table style (0 title, 1 header, 2 data) — the
+/// same classification the picture block's bake follows.
+fn table_row_kind(table: &Table, row: usize) -> usize {
+    let legacy = table.legacy_style_override.clone().unwrap_or_default();
+    let title = !legacy.title_suppressed.unwrap_or(false);
+    let header = !legacy.header_suppressed.unwrap_or(false);
+    if let Some(id) = table
+        .rows
+        .get(row)
+        .map(|row| row.style_id)
+        .filter(|id| (1..=3).contains(id))
+    {
+        return (id - 1) as usize;
+    }
+    if title && row == 0 {
+        0
+    } else if header && row == usize::from(title) {
+        1
+    } else {
+        2
+    }
+}
+
+/// Redraw every cell text of every table that uses `style_handle`, so a table
+/// style edit reaches the drawing. Returns the handles of the tables touched.
+pub(crate) fn patch_tables_using_style(
+    document: &mut codec::CadDocument,
+    style_handle: codec::Handle,
+) -> Vec<codec::Handle> {
+    let style = match document.objects.get(&style_handle) {
+        Some(codec::objects::ObjectType::TableStyle(style)) => style.clone(),
+        _ => return Vec::new(),
+    };
+    let tables: Vec<Table> = document
+        .entities()
+        .filter_map(|entity| match entity {
+            codec::EntityType::Table(table) if table.table_style_handle == Some(style_handle) => {
+                Some((**table).clone())
+            }
+            _ => None,
+        })
+        .collect();
+    let mut touched = Vec::new();
+    for table in tables {
+        let handle = table.common.handle;
+        let mut patched = false;
+        for row in 0..table.rows.len() {
+            let row_style = match table_row_kind(&table, row) {
+                0 => &style.title_row_style,
+                1 => &style.header_row_style,
+                _ => &style.data_row_style,
+            };
+            for column in 0..table.columns.len() {
+                patched |= patch_block_cell_format(document, handle, row, column, Some(row_style));
+            }
+        }
+        if patched {
+            touched.push(handle);
+        }
+    }
+    touched
+}
+
+/// The block text that draws one cell, or `None` when the block does not hold
+/// it (an empty cell the picture never drew).
+fn block_cell_text_target(
+    document: &codec::CadDocument,
+    table_handle: codec::Handle,
+    row: usize,
+    column: usize,
+) -> Option<codec::Handle> {
+    let table = match document.get_entity(table_handle) {
+        Some(codec::EntityType::Table(table)) => (**table).clone(),
+        _ => return None,
+    };
+    // Same block resolution the rebuild uses: the stored handle first, then the
+    // block name (a table that let go of its handle keeps drawing by name).
+    let block = table
+        .block_record_handle
+        .and_then(|handle| {
+            document
+                .block_records
+                .iter()
+                .find(|record| record.handle == handle)
+        })
+        .or_else(|| {
+            (!table.block_name.is_empty())
+                .then(|| document.block_records.get(table.block_name.as_str()))
+                .flatten()
+        })?;
+    // The merged region a cell belongs to carries one text, anchored inside the
+    // region; a plain cell is its own region.
+    let (top, left, bottom, right) =
+        merged_owner_and_span(&table, row, column).unwrap_or((row, column, row, column));
+    let x0: f64 = table
+        .columns
+        .iter()
+        .take(left)
+        .map(|column| column.width)
+        .sum();
+    let x1 = x0
+        + table
+            .columns
+            .iter()
+            .skip(left)
+            .take(right + 1 - left)
+            .map(|column| column.width)
+            .sum::<f64>();
+    let y0: f64 = table.rows.iter().take(top).map(|row| row.height).sum();
+    let y1 = y0
+        + table
+            .rows
+            .iter()
+            .skip(top)
+            .take(bottom + 1 - top)
+            .map(|row| row.height)
+            .sum::<f64>();
+    // Block-local cells step down from the insertion point, so the stored Y of a
+    // row below the first is negative in a block this app baked. A block baked
+    // by another application may use either sign — compare magnitudes.
+    const EPS: f64 = 1.0e-6;
+    block
+        .entity_handles
+        .iter()
+        .copied()
+        .find(|handle| match document.get_entity(*handle) {
+            Some(codec::EntityType::MText(text)) => {
+                let x = text.insertion_point.x;
+                let y = text.insertion_point.y.abs();
+                x >= x0 - EPS && x <= x1 + EPS && y >= y0 - EPS && y <= y1 + EPS
+            }
+            _ => false,
+        })
+}
+
 /// A cell's text height: the content's own format when it overrides it,
 /// else the cell, row, column or table style that sets it, else the
 /// content's value.

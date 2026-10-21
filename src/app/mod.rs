@@ -58,6 +58,8 @@ pub(crate) mod settings;
 mod shortcuts;
 mod startup;
 pub(crate) mod style_ops;
+#[cfg(test)]
+mod table_edit_tests;
 mod text_inline;
 mod tolerance_dialog;
 mod update;
@@ -1370,6 +1372,9 @@ pub(super) struct OpenCADStudio {
     pending_command_editor_text: Option<String>,
     /// Open in-place single-line TEXT editor (plain text-entry box), if any.
     text_inline: Option<text_inline::TextInlineState>,
+    /// Cell the open table cell editor is working on. The viewport highlights
+    /// it so the edit reads as attached to a cell, not just to a prompt.
+    table_cell_edit: Option<crate::modules::annotate::table_cmd::TableCellEditMark>,
     /// Cursor-anchored one-shot snap override menu (Shift+RMB): the canvas
     /// point it opened at, or `None` when closed (#337).
     snap_override_popup: Option<iced::Point>,
@@ -5166,6 +5171,7 @@ impl OpenCADStudio {
             command_mtext_input: false,
             pending_command_editor_text: None,
             text_inline: None,
+            table_cell_edit: None,
             snap_override_popup: None,
             axis_lock_dir: None,
             angle_override: None,

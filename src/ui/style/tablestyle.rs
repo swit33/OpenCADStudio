@@ -44,6 +44,8 @@ pub struct TableStyleView<'a> {
     pub vmargin: &'a str,
     pub description: &'a str,
     pub cell_textstyle: &'a [String; 3],
+    /// Document text styles the row cell can pick from.
+    pub text_styles: Vec<String>,
     pub cell_height: &'a [String; 3],
     pub cell_textcolor: &'a [String; 3],
     pub cell_fillcolor: &'a [String; 3],
@@ -274,6 +276,10 @@ impl canvas::Program<Message> for TablePreviewCanvas {
                 } else {
                     (y0 + y1) * 0.5
                 };
+                // TODO: the sample text is drawn with the UI font, so a
+                // chosen text style (a vertical @-font included) reaches the
+                // preview only as its name in the caption below. Showing it
+                // needs the CAD stroke/TrueType text renderer in the preview.
                 frame.fill_text(canvas::Text {
                     content: label,
                     position: Point::new(x, y),
@@ -388,12 +394,31 @@ fn cell_editor<'a>(v: &TableStyleView<'a>, row_index: u8) -> Element<'a, Message
     let selected_alignment = format!("{:?}", row_style.alignment);
     let mut content = Column::new()
         .spacing(7)
-        .push(cell_input(
-            t!("Text style"),
-            "Standard",
-            &v.cell_textstyle[index],
-            "textstyle",
-        ))
+        .push(
+            row![
+                text(t!("Text style"))
+                    .size(11)
+                    .style(muted_style)
+                    .width(155),
+                iced::widget::pick_list(
+                    v.text_styles
+                        .iter()
+                        .find(|name| name.eq_ignore_ascii_case(v.cell_textstyle[index].trim()))
+                        .cloned(),
+                    v.text_styles.clone(),
+                    |value| value.to_string(),
+                )
+                .on_select(move |value| Message::TableStyleCellEdit {
+                    row: row_index,
+                    field: "textstyle",
+                    value,
+                })
+                .text_size(11)
+                .width(170),
+            ]
+            .spacing(8)
+            .align_y(iced::Center),
+        )
         .push(cell_input(
             t!("Text height"),
             "0.18",

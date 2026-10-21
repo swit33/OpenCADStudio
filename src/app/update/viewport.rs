@@ -6745,6 +6745,13 @@ properties={:.1}ms picked={}",
                             handle.value()
                         )));
                     }
+                } else if self.begin_table_cell_edit(i, codec::Handle::NULL, click_world)
+                    != crate::modules::annotate::table_cmd::TableCellEditStart::NoCell
+                {
+                    // No wire under the cursor (the middle of a cell is empty
+                    // space): resolve the cell by its grid instead, the same
+                    // way TABLEDIT's point pick does.
+                    return Task::none();
                 }
             }
         }
@@ -6808,8 +6815,16 @@ properties={:.1}ms picked={}",
                 .and_then(|s| Scene::handle_from_wire_name(s));
 
                 // In paper space, text editing takes precedence over entering MSPACE.
-                // This mirrors the model-space double-click behaviour.
+                // This mirrors the model-space double-click behaviour. A table cell
+                // comes first: paper space is where most tables are drawn, and the
+                // model-space branch never runs for a layout.
                 if let Some(handle) = raw_wire_hit {
+                    if self.tabs[i].scene.locked_layer_name(handle).is_none()
+                        && self.begin_table_cell_edit(i, handle, click_world)
+                            != crate::modules::annotate::table_cmd::TableCellEditStart::NoCell
+                    {
+                        return Task::none();
+                    }
                     let is_editable_text = self.tabs[i]
                         .scene
                         .document
@@ -6832,6 +6847,21 @@ properties={:.1}ms picked={}",
 
                         return self.begin_text_edit(handle);
                     }
+                } else if (self.tabs[i].scene.active_viewport.is_some()
+                    || self
+                        .tabs[i]
+                        .scene
+                        .viewport_at_screen_point(p.x, p.y, (vw, vh))
+                        .is_none())
+                    && self.begin_table_cell_edit(i, codec::Handle::NULL, click_world)
+                        != crate::modules::annotate::table_cmd::TableCellEditStart::NoCell
+                {
+                    // Clicked the middle of a cell: no wire under the cursor, so
+                    // resolve the cell by its grid instead of falling through to
+                    // viewport entry. A viewport under the cursor keeps winning
+                    // that gesture — entering it is what a double-click there
+                    // means in paper space.
+                    return Task::none();
                 }
 
                 // If the double-click was not on editable text, keep the existing

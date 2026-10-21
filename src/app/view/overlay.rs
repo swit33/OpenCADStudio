@@ -74,6 +74,104 @@ pub(super) fn text_inline_overlay(
     position_canvas_overlay(anchor, panel.into())
 }
 
+/// Screen rectangle of the cell the open table cell editor is working on, or
+/// `None` when no cell editor is up or the cell cannot be projected.
+pub(super) fn table_cell_edit_rect(app: &super::super::OpenCADStudio) -> Option<iced::Rectangle> {
+    let mark = app.table_cell_edit?;
+    let scene = &app.tabs[app.active_tab].scene;
+    let table = match scene.document.get_entity(mark.handle)? {
+        codec::EntityType::Table(table) => table,
+        _ => return None,
+    };
+    let style = table
+        .table_style_handle
+        .and_then(|handle| scene.document.objects.get(&handle))
+        .and_then(|object| match object {
+            codec::objects::ObjectType::TableStyle(style) => Some(style),
+            _ => None,
+        });
+    let corners =
+        crate::modules::annotate::table_cmd::cell_rect_world(table, style, mark.row, mark.column)?;
+    let (vp_w, vp_h) = scene.selection.borrow().view.vp_size;
+    if vp_w <= 1.0 || vp_h <= 1.0 {
+        return None;
+    }
+    // Inside a floating viewport the pane is the viewport's own screen rect and
+    // camera; everywhere else the drawing camera covers the whole canvas.
+    let (view_rot, eye, bounds, offset) = match scene.viewport_edit_frame((vp_w, vp_h)) {
+        Some((camera, rect)) => {
+            let pane = iced::Rectangle {
+                x: 0.0,
+                y: 0.0,
+                width: rect.width,
+                height: rect.height,
+            };
+            (
+                camera.view_proj_rte(pane),
+                camera.eye(),
+                pane,
+                iced::Point::new(rect.x, rect.y),
+            )
+        }
+        None => {
+            let camera = scene.camera.borrow();
+            let canvas = iced::Rectangle {
+                x: 0.0,
+                y: 0.0,
+                width: vp_w,
+                height: vp_h,
+            };
+            (
+                camera.view_proj_rte(canvas),
+                camera.eye(),
+                canvas,
+                iced::Point::new(0.0, 0.0),
+            )
+        }
+    };
+    let mut min_x = f32::INFINITY;
+    let mut min_y = f32::INFINITY;
+    let mut max_x = f32::NEG_INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+    for corner in corners {
+        let p = crate::scene::pick::hit_test::world_to_screen(corner, view_rot, eye, bounds);
+        let p = iced::Point::new(p.x + offset.x, p.y + offset.y);
+        min_x = min_x.min(p.x);
+        min_y = min_y.min(p.y);
+        max_x = max_x.max(p.x);
+        max_y = max_y.max(p.y);
+    }
+    let (width, height) = (max_x - min_x, max_y - min_y);
+    if !width.is_finite() || !height.is_finite() || width <= 0.5 || height <= 0.5 {
+        return None;
+    }
+    Some(iced::Rectangle {
+        x: min_x,
+        y: min_y,
+        width,
+        height,
+    })
+}
+
+/// Outline around the cell being edited (the open cell editor's target).
+pub(super) fn table_cell_edit_overlay(rect: iced::Rectangle) -> Element<'static, Message> {
+    let panel = container(Space::new())
+        .width(Length::Fixed(rect.width))
+        .height(Length::Fixed(rect.height))
+        .style(|theme: &Theme| {
+            let palette = theme.palette();
+            container::Style {
+                border: Border {
+                    color: palette.primary.base.color,
+                    width: 2.0,
+                    radius: 2.0.into(),
+                },
+                ..Default::default()
+            }
+        });
+    position_canvas_overlay(iced::Point::new(rect.x, rect.y), panel.into())
+}
+
 // Stroke-font families bundled with the renderer; see scene/lff.rs.
 const MTEXT_FONTS: [&str; 10] = [
     "[Style default]",

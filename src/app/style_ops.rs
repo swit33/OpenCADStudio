@@ -943,6 +943,31 @@ impl OpenCADStudio {
 
             let mut changed_mleaders = Vec::new();
 
+            // A table's drawing is its own baked block, made under the style
+            // that was just edited. Restamping each cell's text format from the
+            // new style is the only way the change can show without rebuilding
+            // the block (a rebuild reproduces neither text style nor rotation).
+            let mut restyled_tables = Vec::new();
+            for handle in &object_handles {
+                if matches!(
+                    self.tabs[i].scene.document.objects.get(handle),
+                    Some(codec::objects::ObjectType::TableStyle(_))
+                ) {
+                    restyled_tables.extend(crate::entities::table::patch_tables_using_style(
+                        &mut self.tabs[i].scene.document,
+                        *handle,
+                    ));
+                }
+            }
+            if !restyled_tables.is_empty() {
+                let changes: Vec<_> = restyled_tables
+                    .iter()
+                    .map(|handle| (*handle, crate::scene::ChangeKind::Modified))
+                    .collect();
+                self.tabs[i].scene.bump_entities(&changes);
+                self.tabs[i].scene.bump_geometry();
+            }
+
             for style in changed_mleader_styles {
                 let entity_handles: Vec<codec::Handle> = {
                     let doc = &self.tabs[i].scene.document;

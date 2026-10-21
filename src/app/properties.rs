@@ -3296,9 +3296,56 @@ handles={handles_ms:.1} panel={:.1} ribbon={ribbon_ms:.1} tail={:.1} selected={}
         for &handle in handles {
             apply(self, handle);
         }
+        // A table cell's format is stored on the cell, but the drawing is the
+        // table's baked picture block: push the edited cell's resolved format
+        // onto its text there, so the change shows without rebuilding the block
+        // (a rebuild loses the authored per-cell text style and rotation).
+        self.patch_edited_table_cells(i, handles);
         self.invalidate_property_targets(i, handles);
         self.tabs[i].dirty = true;
         self.refresh_properties();
+    }
+
+    /// Re-stamp the cell in focus onto the table's baked block after a
+    /// Properties edit. No-op unless the entity is a table and a cell is armed.
+    fn patch_edited_table_cells(&mut self, i: usize, handles: &[Handle]) {
+        if !self.tabs[i].properties.prop_vertex_indicator_active {
+            return;
+        }
+        let mut patched = false;
+        for &handle in handles {
+            let Some(codec::EntityType::Table(table)) =
+                self.tabs[i].scene.document.get_entity(handle)
+            else {
+                continue;
+            };
+            if table.block_record_handle.is_none() {
+                continue;
+            }
+            let columns = table.column_count().max(1);
+            let index = self.tabs[i].properties.prop_vertex;
+            let (row, column) = (index / columns, index % columns);
+            let value = table.cell_text(row, column).unwrap_or_default().to_string();
+            patched |= crate::entities::table::patch_block_cell_format(
+                &mut self.tabs[i].scene.document,
+                handle,
+                row,
+                column,
+                None,
+            );
+            // The panel edits the cell's content too: rewrite that text as well,
+            // or a content edit would change the data and nothing on screen.
+            patched |= crate::entities::table::patch_block_cell_text(
+                &mut self.tabs[i].scene.document,
+                handle,
+                row,
+                column,
+                &value,
+            );
+        }
+        if patched {
+            self.tabs[i].scene.bump_geometry();
+        }
     }
 
     /// Add an entity to the correct space (model or paper space layout).

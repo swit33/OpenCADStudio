@@ -209,6 +209,8 @@ impl OpenCADStudio {
             self.command_line.clear_contextual_suggestions();
             self.restore_add_selected_defaults();
             self.tabs[i].pending_pause_tokens = None;
+            // The cell editor is over: drop the cell highlight with it.
+            self.table_cell_edit = None;
         }
         if self.tabs[i].active_cmd.is_some() && self.tabs[i].pending_pause_tokens.is_some() {
             let drain_task = self.drain_pending_pause_tokens(i);
@@ -246,6 +248,11 @@ impl OpenCADStudio {
             for entity in self.tabs[i].scene.document.entities() {
                 if let codec::EntityType::Table(table) = entity {
                     let h = table.common.handle;
+                    // Only tables of the space being edited: a model-space
+                    // table and a paper-space one can overlap in world XY.
+                    if !self.tabs[i].scene.entity_belongs_to_active_space(h) {
+                        continue;
+                    }
                     let style = table.table_style_handle.and_then(|style_handle| {
                         self.tabs[i]
                             .scene
@@ -291,6 +298,11 @@ impl OpenCADStudio {
         if hit.locked {
             return TableCellEditStart::LockedCell;
         }
+        self.table_cell_edit = Some(crate::modules::annotate::table_cmd::TableCellEditMark {
+            handle,
+            row: hit.row,
+            column: hit.column,
+        });
         let command = crate::modules::annotate::table_cmd::TableCellEditCommand::new(
             handle, &table, hit.row, hit.column,
         );
@@ -578,8 +590,13 @@ impl OpenCADStudio {
             result @ CmdResult::EditBlockAuthoring { .. } => {
                 return self.handle_authoring_edit(result);
             }
-            CmdResult::SetBlockActionBars { document,definition,mode,parameters } => {
-                return self.set_action_bars(document,definition,mode,parameters);
+            CmdResult::SetBlockActionBars {
+                document,
+                definition,
+                mode,
+                parameters,
+            } => {
+                return self.set_action_bars(document, definition, mode, parameters);
             }
             result @ (CmdResult::PlaceBlockAction { .. }
             | CmdResult::EditBlockActionSet { .. }
@@ -902,6 +919,14 @@ impl OpenCADStudio {
                 if let Some(task) = self.handle_edit_table_cell(handle, point) {
                     return task;
                 }
+            }
+            CmdResult::WriteTableCell {
+                handle,
+                row,
+                column,
+                text,
+            } => {
+                self.handle_write_table_cell(handle, row, column, text);
             }
             CmdResult::MatchEntityLayer { dest, src } => {
                 self.handle_match_entity_layer(dest, src);
@@ -1500,6 +1525,43 @@ impl OpenCADStudio {
         None
     }
 
+    /// Write a cell's text and redraw only that cell in the table's baked
+    /// picture block. Editing content must not cost the table its authored
+    /// styling: the block is kept and one text is rewritten (see
+    /// `patch_block_cell_text`), and the whole edit lands in one undo step.
+    fn handle_write_table_cell(&mut self, handle: Handle, row: usize, column: usize, text: String) {
+        let i = self.active_tab;
+        if self.reject_locked_edit(i, handle) {
+            self.tabs[i].active_cmd = None;
+            return;
+        }
+        self.push_undo_snapshot(i, "TABLE CELL");
+        let doc = &mut self.tabs[i].scene.document;
+        if let Some(codec::EntityType::Table(table)) = doc.get_entity_mut(handle) {
+            if let Some(cell) = table.cell_mut(row, column) {
+                cell.set_text(&text);
+            }
+        }
+        let patched =
+            crate::entities::table::patch_block_cell_text(doc, handle, row, column, &text);
+        if !patched {
+            // A cell the picture block never drew has no text to rewrite:
+            // dropping the picture makes the table draw itself from the cells.
+            if let Some(codec::EntityType::Table(table)) = doc.get_entity_mut(handle) {
+                table.block_record_handle = None;
+            }
+        }
+        self.tabs[i]
+            .scene
+            .bump_entities(&[(handle, crate::scene::ChangeKind::Modified)]);
+        // A patched block keeps its entities: its cached geometry is what moved.
+        self.tabs[i].scene.bump_geometry();
+        self.tabs[i].dirty = true;
+        self.tabs[i].active_cmd = None;
+        self.tabs[i].snap_result = None;
+        self.refresh_properties();
+    }
+
     fn handle_delete_groups(&mut self, mut handles: Vec<Handle>) -> Option<Task<Message>> {
         let i = self.active_tab;
         handles.retain(|handle| !self.tabs[i].scene.is_layer_locked(*handle));
@@ -1543,6 +1605,9 @@ impl OpenCADStudio {
             for entity in self.tabs[i].scene.document.entities() {
                 if let codec::EntityType::Table(table) = entity {
                     let h = table.common.handle;
+                    if !self.tabs[i].scene.entity_belongs_to_active_space(h) {
+                        continue;
+                    }
                     let style = table.table_style_handle.and_then(|style_handle| {
                         self.tabs[i]
                             .scene

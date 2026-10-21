@@ -2352,6 +2352,9 @@ bg={bg_ms:.1}ms n={view_count}"
                 34.0 + self.command_line.overlay_lines_height()
             };
             if !tab.is_start {
+                if let Some(rect) = overlay::table_cell_edit_rect(self) {
+                    viewport_stack = viewport_stack.push(overlay::table_cell_edit_overlay(rect));
+                }
                 if let Some(readout) = self.measurement_readout(self.active_tab) {
                     viewport_stack = viewport_stack.push(overlay::measurement_overlay(
                         readout.anchor,

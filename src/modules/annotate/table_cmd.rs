@@ -652,16 +652,23 @@ impl TableCellHit {
     }
 }
 
-/// Resolve the table cell under `click_world`. Shared by the double-click
-/// shortcut and the TABLEDIT command so both agree on grid coordinates,
-/// flow direction and locked-cell detection. `table_style` is the style
-/// object the table references, when the caller has the document at hand;
-/// the table's embedded base style covers the common fallbacks.
-pub(crate) fn table_cell_at(
+/// The cell the open cell editor is working on — what the viewport highlights
+/// so "editing" is visibly attached to a cell instead of only a prompt line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TableCellEditMark {
+    pub handle: codec::Handle,
+    pub row: usize,
+    pub column: usize,
+}
+
+/// The table's grid frame: the column direction, the row direction (down the
+/// page unless the style flows bottom-to-top) and the insertion origin.
+/// Shared by the cell resolver and the cell highlight so both agree on which
+/// cell is which and where its corners are.
+fn table_axes(
     table: &codec::entities::Table,
     table_style: Option<&codec::objects::TableStyle>,
-    click_world: DVec3,
-) -> Option<TableCellHit> {
+) -> (glam::DVec3, glam::DVec3, glam::DVec3) {
     let horizontal = glam::DVec3::new(
         table.horizontal_direction.x,
         table.horizontal_direction.y,
@@ -679,6 +686,42 @@ pub(crate) fn table_cell_at(
         table.insertion_point.y,
         table.insertion_point.z,
     );
+    (horizontal, down, origin)
+}
+
+/// World-space corners of one cell, in order, or `None` when the row/column is
+/// outside the grid. The editor highlights the cell it is working on with them.
+pub(crate) fn cell_rect_world(
+    table: &codec::entities::Table,
+    table_style: Option<&codec::objects::TableStyle>,
+    row: usize,
+    column: usize,
+) -> Option<[glam::DVec3; 4]> {
+    let (horizontal, down, origin) = table_axes(table, table_style);
+    let x0: f64 = table.columns.iter().take(column).map(|c| c.width).sum();
+    let x1 = x0 + table.columns.get(column)?.width;
+    let y0: f64 = table.rows.iter().take(row).map(|r| r.height).sum();
+    let y1 = y0 + table.rows.get(row)?.height;
+    let corner = |x: f64, y: f64| origin + horizontal * x + down * y;
+    Some([
+        corner(x0, y0),
+        corner(x1, y0),
+        corner(x1, y1),
+        corner(x0, y1),
+    ])
+}
+
+/// Resolve the table cell under `click_world`. Shared by the double-click
+/// shortcut and the TABLEDIT command so both agree on grid coordinates,
+/// flow direction and locked-cell detection. `table_style` is the style
+/// object the table references, when the caller has the document at hand;
+/// the table's embedded base style covers the common fallbacks.
+pub(crate) fn table_cell_at(
+    table: &codec::entities::Table,
+    table_style: Option<&codec::objects::TableStyle>,
+    click_world: DVec3,
+) -> Option<TableCellHit> {
+    let (horizontal, down, origin) = table_axes(table, table_style);
     let relative = click_world - origin;
     let x = relative.dot(horizontal);
     let y = relative.dot(down);
@@ -829,15 +872,14 @@ impl CadCommand for TableCellEditCommand {
             .replace("/n", "\\P")
             .replace("\\n", "\\P")
             .replace('\n', "\\P");
-        cell.set_text(&formatted);
-        self.table.block_record_handle = None;
-        Some(CmdResult::ReplaceMany(
-            vec![(
-                self.handle,
-                vec![EntityType::Table(Box::new(self.table.clone()))],
-            )],
-            Vec::new(),
-        ))
+        // The host writes the cell so it can redraw just this cell in the
+        // table's picture block, keeping every other cell as authored.
+        Some(CmdResult::WriteTableCell {
+            handle: self.handle,
+            row: self.row,
+            column: self.column,
+            text: formatted,
+        })
     }
 
     // Bare Enter (empty buffer) ends the edit *without* writing — the
@@ -933,6 +975,46 @@ mod tabledit_tests {
     }
 
     #[test]
+    fn cell_rect_matches_the_resolved_cell() {
+        use super::cell_rect_world;
+
+        let table = table_2x2();
+        let corners = cell_rect_world(&table, None, 0, 1).expect("cell exists");
+        // Row 0 column 1: x from 2.5 to 5.0, y from 0 down to -0.25.
+        assert_eq!(corners[0], DVec3::new(2.5, 0.0, 0.0));
+        assert_eq!(corners[1], DVec3::new(5.0, 0.0, 0.0));
+        assert_eq!(corners[2], DVec3::new(5.0, -0.25, 0.0));
+        assert_eq!(corners[3], DVec3::new(2.5, -0.25, 0.0));
+        // The centre of that rectangle resolves back to the same cell.
+        let centre = DVec3::new(3.75, -0.125, 0.0);
+        assert_eq!(
+            table_cell_at(&table, None, centre).map(|hit| (hit.row, hit.column)),
+            Some((0, 1))
+        );
+    }
+
+    #[test]
+    fn cell_rect_follows_flow_and_rejects_off_grid_cells() {
+        use super::cell_rect_world;
+        use codec::entities::table::CellStylePropertyFlags;
+
+        let table = table_2x2();
+        assert!(cell_rect_world(&table, None, 2, 0).is_none());
+        assert!(cell_rect_world(&table, None, 0, 2).is_none());
+
+        // A base style that flows bottom-to-top flips the row direction.
+        let mut up = table_2x2();
+        let style = codec::entities::table::CellStyle {
+            property_flags: CellStylePropertyFlags::FLOW_DIRECTION_BOTTOM_TO_TOP,
+            ..Default::default()
+        };
+        up.base_style = Some(style);
+        let corners = cell_rect_world(&up, None, 0, 0).expect("cell exists");
+        assert_eq!(corners[0], DVec3::new(0.0, 0.0, 0.0));
+        assert_eq!(corners[2], DVec3::new(2.5, 0.25, 0.0));
+    }
+
+    #[test]
     fn tabledit_point_hands_point_to_host() {
         let mut cmd = TableditCommand::new();
         assert!(!cmd.needs_entity_pick());
@@ -956,15 +1038,17 @@ mod tabledit_tests {
             .on_text_input("Line1/nLine2\\nLine3\nLine4")
             .expect("cell edit commits");
         match result {
-            CmdResult::ReplaceMany(repl, _) => {
-                assert_eq!(repl.len(), 1);
-                if let codec::EntityType::Table(t) = &repl[0].1[0] {
-                    assert_eq!(t.cell_text(0, 0).unwrap(), "Line1\\PLine2\\PLine3\\PLine4");
-                } else {
-                    panic!("expected Table entity");
-                }
+            CmdResult::WriteTableCell {
+                handle: target,
+                row,
+                column,
+                text,
+            } => {
+                assert_eq!(target, handle);
+                assert_eq!((row, column), (0, 0));
+                assert_eq!(text, "Line1\\PLine2\\PLine3\\PLine4");
             }
-            _ => panic!("expected ReplaceMany"),
+            _ => panic!("expected WriteTableCell"),
         }
     }
 }

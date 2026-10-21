@@ -1994,6 +1994,16 @@ pub enum CmdResult {
     },
     /// Cancel: discard any preview and end the command.
     Cancel,
+    /// End the command and write `text` into cell (`row`, `column`) of the table
+    /// at `handle`. The host owns the write so the table's baked picture block
+    /// keeps its authored styling: only that cell's text is redrawn, and the
+    /// edit lands in one undo step with the cell data.
+    WriteTableCell {
+        handle: Handle,
+        row: usize,
+        column: usize,
+        text: String,
+    },
     /// End the command and begin in-place editing of the table cell under
     /// `point` on table `handle` (TABLEDIT). The host resolves the cell —
     /// it owns the document needed for the table-style lookup — honors

@@ -949,6 +949,14 @@ impl OpenCADStudio {
                     ObjectType::TableStyle(s) if s.name == self.tablestyle_selected => Some(s),
                     _ => None,
                 });
+                // The document's text styles: the table style's row cells pick one.
+                let text_styles: Vec<String> = tab
+                    .scene
+                    .document
+                    .text_styles
+                    .iter()
+                    .map(|style| style.name.clone())
+                    .collect();
                 let compare_opts: Vec<String> = styles
                     .iter()
                     .filter(|name| !name.eq_ignore_ascii_case(&self.tablestyle_selected))
@@ -1020,6 +1028,7 @@ impl OpenCADStudio {
                             vmargin: &self.ts_vmargin,
                             description: &self.ts_description,
                             cell_textstyle: &self.ts_cell_textstyle,
+                            text_styles: text_styles.clone(),
                             cell_height: &self.ts_cell_height,
                             cell_textcolor: &self.ts_cell_textcolor,
                             cell_fillcolor: &self.ts_cell_fillcolor,

@@ -6683,7 +6683,7 @@ properties={:.1}ms picked={}",
                     if self.begin_table_cell_edit(i, handle, click_world)
                         != crate::modules::annotate::table_cmd::TableCellEditStart::NoCell
                     {
-                        return Task::none();
+                        return crate::app::table_cell_edit::focus_sink();
                     }
                     // A constraint dimension edits its parameter from the
                     // command line, standing in for the reference's in-place
@@ -6751,7 +6751,7 @@ properties={:.1}ms picked={}",
                     // No wire under the cursor (the middle of a cell is empty
                     // space): resolve the cell by its grid instead, the same
                     // way TABLEDIT's point pick does.
-                    return Task::none();
+                    return crate::app::table_cell_edit::focus_sink();
                 }
             }
         }
@@ -6823,7 +6823,7 @@ properties={:.1}ms picked={}",
                         && self.begin_table_cell_edit(i, handle, click_world)
                             != crate::modules::annotate::table_cmd::TableCellEditStart::NoCell
                     {
-                        return Task::none();
+                        return crate::app::table_cell_edit::focus_sink();
                     }
                     let is_editable_text = self.tabs[i]
                         .scene
@@ -6861,7 +6861,7 @@ properties={:.1}ms picked={}",
                     // viewport entry. A viewport under the cursor keeps winning
                     // that gesture — entering it is what a double-click there
                     // means in paper space.
-                    return Task::none();
+                    return crate::app::table_cell_edit::focus_sink();
                 }
 
                 // If the double-click was not on editable text, keep the existing

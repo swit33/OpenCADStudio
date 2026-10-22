@@ -6770,6 +6770,32 @@ impl Scene {
         }
     }
 
+    /// The contents of a block changed: cached block expansions must be rebuilt
+    /// while nothing else on screen is invalidated. The caller still bumps the
+    /// entities that consume the block.
+    pub fn bump_block_epoch(&mut self) {
+        self.block_epoch = GEOMETRY_EPOCH.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One block's definition changed: rebuild that block only, and leave every
+    /// other cached definition in place.
+    ///
+    /// `bump_block_epoch` throws the whole cache away, so the next frame re-walks
+    /// every block in the drawing — measured at ~170 ms on an ordinary sheet, on
+    /// the frame right after the edit. Editing one table cell changes exactly one
+    /// block (the table's picture), which is a fraction of that. The caller still
+    /// bumps the entities drawn from the block.
+    pub fn invalidate_block_definition(&mut self, block_name: &str) {
+        if block_name.is_empty() {
+            return;
+        }
+        let depth_map = self.draw_depth_map();
+        let mut cache = self.block_defn_cache.borrow_mut();
+        for (_, (_, arc)) in cache.iter_mut() {
+            *arc = Arc::new(arc.rebuild_defn(&self.document, block_name, &depth_map));
+        }
+    }
+
     /// Set (or clear) the previewed entity that renders with the selection
     /// highlight without joining the real selection. Only refreshes the GPU
     /// xray overlay (no re-tessellation).

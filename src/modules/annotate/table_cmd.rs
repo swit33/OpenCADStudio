@@ -652,15 +652,6 @@ impl TableCellHit {
     }
 }
 
-/// The cell the open cell editor is working on — what the viewport highlights
-/// so "editing" is visibly attached to a cell instead of only a prompt line.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct TableCellEditMark {
-    pub handle: codec::Handle,
-    pub row: usize,
-    pub column: usize,
-}
-
 /// The table's grid frame: the column direction, the row direction (down the
 /// page unless the style flows bottom-to-top) and the insertion origin.
 /// Shared by the cell resolver and the cell highlight so both agree on which
@@ -698,10 +689,33 @@ pub(crate) fn cell_rect_world(
     column: usize,
 ) -> Option<[glam::DVec3; 4]> {
     let (horizontal, down, origin) = table_axes(table, table_style);
-    let x0: f64 = table.columns.iter().take(column).map(|c| c.width).sum();
-    let x1 = x0 + table.columns.get(column)?.width;
-    let y0: f64 = table.rows.iter().take(row).map(|r| r.height).sum();
-    let y1 = y0 + table.rows.get(row)?.height;
+    // Out-of-grid coordinates have no rectangle: the merged-span lookup below
+    // would happily clamp them onto the last row or column.
+    if row >= table.rows.len() || column >= table.columns.len() {
+        return None;
+    }
+    // The whole span a merged cell covers — a click may land on any member,
+    // and the cell's text is laid out across the entire merged rectangle.
+    let (top, left, bottom, right) =
+        crate::entities::table::containing_cell_span(table, row, column);
+    let x0: f64 = table.columns.iter().take(left).map(|c| c.width).sum();
+    let x1 = x0
+        + table
+            .columns
+            .iter()
+            .skip(left)
+            .take(right + 1 - left)
+            .map(|c| c.width)
+            .sum::<f64>();
+    let y0: f64 = table.rows.iter().take(top).map(|r| r.height).sum();
+    let y1 = y0
+        + table
+            .rows
+            .iter()
+            .skip(top)
+            .take(bottom + 1 - top)
+            .map(|r| r.height)
+            .sum::<f64>();
     let corner = |x: f64, y: f64| origin + horizontal * x + down * y;
     Some([
         corner(x0, y0),
@@ -760,10 +774,10 @@ pub(crate) fn cell_locked(table: &codec::entities::Table, row: usize, column: us
     })
 }
 
-/// TABLEDIT — edit a table cell's text by picking it. The pick only
-/// collects (table, point); the host resolves the cell and launches
-/// `TableCellEditCommand`, so the command-first flow and the double-click
-/// shortcut share one resolver and one editor setup.
+/// TABLEDIT — edit a table cell's text by picking it. The pick only collects
+/// (table, point); the host resolves the cell and opens the in-place editor on
+/// it, so the command-first flow and the double-click shortcut share one
+/// resolver and one editor.
 pub struct TableditCommand;
 
 impl TableditCommand {
@@ -805,98 +819,13 @@ inventory::submit!(crate::command::CommandRegistration {
     names: &["TABLEDIT"]
 });
 
-pub struct TableCellEditCommand {
-    handle: codec::Handle,
-    table: codec::entities::Table,
-    row: usize,
-    column: usize,
-}
-
-impl TableCellEditCommand {
-    pub fn new(
-        handle: codec::Handle,
-        table: &codec::entities::Table,
-        row: usize,
-        column: usize,
-    ) -> Self {
-        Self {
-            handle,
-            table: table.clone(),
-            row,
-            column,
-        }
-    }
-}
-
-impl CadCommand for TableCellEditCommand {
-    fn name(&self) -> &'static str {
-        "TABLE CELL"
-    }
-
-    fn prompt(&self) -> String {
-        let current = self
-            .table
-            .cell_text(self.row, self.column)
-            .unwrap_or("")
-            .replace("\\P", "/n");
-        t!(
-            "TABLE CELL  Enter text for [%{row},%{column}] <%{current}>:",
-            row = self.row,
-            column = self.column,
-            current = current
-        )
-        .into_owned()
-    }
-
-    // Cell content is free-form prose ("Foo Bar"): Space must type a
-    // literal space instead of submitting, Enter finishes, and
-    // /n or \n inserts a line break.
-    fn input_kind(&self) -> InputKind {
-        InputKind::FreeText
-    }
-
-    fn on_point(&mut self, _point: DVec3) -> CmdResult {
-        CmdResult::NeedPoint
-    }
-
-    fn on_text_input(&mut self, text: &str) -> Option<CmdResult> {
-        use codec::entities::table::CellStateFlags;
-        let cell = self.table.cell_mut(self.row, self.column)?;
-        if cell
-            .state
-            .intersects(CellStateFlags::CONTENT_LOCKED | CellStateFlags::CONTENT_READ_ONLY)
-        {
-            return Some(CmdResult::Cancel);
-        }
-        let formatted = text
-            .replace("/n", "\\P")
-            .replace("\\n", "\\P")
-            .replace('\n', "\\P");
-        // The host writes the cell so it can redraw just this cell in the
-        // table's picture block, keeping every other cell as authored.
-        Some(CmdResult::WriteTableCell {
-            handle: self.handle,
-            row: self.row,
-            column: self.column,
-            text: formatted,
-        })
-    }
-
-    // Bare Enter (empty buffer) ends the edit *without* writing — the
-    // host routes an empty submit here instead of on_text_input(""), so
-    // pressing Enter on an untouched cell keeps its current content.
-    fn on_enter(&mut self) -> CmdResult {
-        CmdResult::Cancel
-    }
-}
-
 #[cfg(test)]
 mod tabledit_tests {
     //! `table_cell_at` is the one resolver shared by the double-click
     //! shortcut and the TABLEDIT pick, so its grid math is pinned here.
     //! `Table::new` seeds 2.5-unit columns and 0.25-unit rows with the
     //! default orientation (horizontal +X, flow down).
-    use super::{table_cell_at, TableCellEditCommand, TableCellHit, TableditCommand};
+    use super::{table_cell_at, TableCellHit, TableditCommand};
     use crate::command::{CadCommand, CmdResult};
     use codec::entities::table::CellStateFlags;
     use codec::entities::Table;
@@ -1027,28 +956,5 @@ mod tabledit_tests {
         }
         // A bare Enter at the pick prompt ends the command.
         assert!(matches!(cmd.on_enter(), CmdResult::Cancel));
-    }
-
-    #[test]
-    fn table_cell_edit_formats_newlines() {
-        let table = table_2x2();
-        let handle = codec::Handle::new(42);
-        let mut edit_cmd = TableCellEditCommand::new(handle, &table, 0, 0);
-        let result = edit_cmd
-            .on_text_input("Line1/nLine2\\nLine3\nLine4")
-            .expect("cell edit commits");
-        match result {
-            CmdResult::WriteTableCell {
-                handle: target,
-                row,
-                column,
-                text,
-            } => {
-                assert_eq!(target, handle);
-                assert_eq!((row, column), (0, 0));
-                assert_eq!(text, "Line1\\PLine2\\PLine3\\PLine4");
-            }
-            _ => panic!("expected WriteTableCell"),
-        }
     }
 }

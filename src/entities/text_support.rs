@@ -797,6 +797,26 @@ pub fn adapt_mtext_paragraphs(
     }
 
     if !trim_blank_edges {
+        // A value ending with a hard break (`...\\P`) opens one more, empty
+        // line — the line an in-place editor puts the caret on after the user
+        // presses Enter at the end. `parse_mtext` drops that empty paragraph, so
+        // without this the editor has no line to hang the caret on and it stays
+        // glued to the line above. Drawing trims blank edges and never asks for
+        // it.
+        if ends_with_break(s) {
+            lines.push(MTextLine {
+                runs: Vec::new(),
+                align: None,
+                indent_first: 0.0,
+                indent_left: 0.0,
+                indent_right: 0.0,
+                tab_stops: Vec::new(),
+                starts_column: false,
+                space_before: 0.0,
+                space_after: 0.0,
+                line_spacing: None,
+            });
+        }
         return lines;
     }
     let start = lines.iter().position(|l| !l.is_blank()).unwrap_or(0);
@@ -806,6 +826,20 @@ pub fn adapt_mtext_paragraphs(
         .map(|i| i + 1)
         .unwrap_or(0);
     lines[start..end].to_vec()
+}
+
+/// True when an MText value ends with a hard paragraph break — a trailing empty
+/// paragraph, which `parse_mtext` drops and `to_mtext_string` re-emits only as the
+/// break. `to_mtext_string` wraps multi-paragraph output in `{…}`, so strip a
+/// trailing `}` first, then require an ODD run of backslashes before a final `P`
+/// (an even run is an escaped literal `\\`, not the `\P` break code).
+pub fn ends_with_break(raw: &str) -> bool {
+    let s = raw.trim_end();
+    let s = s.strip_suffix('}').unwrap_or(s);
+    match s.strip_suffix('P') {
+        Some(rest) => rest.chars().rev().take_while(|&c| c == '\\').count() % 2 == 1,
+        None => false,
+    }
 }
 
 // Legacy MText helpers (`strip_mtext_codes`, `split_mtext_lines`,
@@ -1517,6 +1551,10 @@ pub struct GlyphBox {
     /// [left, bottom, right, top]: exact for rotated text, where the world
     /// box above is only the bounds of two corners.
     pub local: [f32; 4],
+    /// The cell's four world corners, in cell-local reading order
+    /// [bottom-left, bottom-right, top-right, top-left]. Exact for rotated
+    /// text (the AABB above is not): the caret draws from these edges.
+    pub quad: [(f32, f32); 4],
 }
 
 /// Output of [`layout_mtext`]: stroke groups + the geometry the caller
@@ -1596,6 +1634,10 @@ pub fn layout_mtext(opts: &MTextRenderOpts) -> MTextLayout {
         space_after: f32,
         /// Paragraph line-spacing override applied to this line's advance.
         line_spacing: Option<ParaLineSpacing>,
+        /// Where this line's paragraph starts in the layout's character space.
+        /// The break that opened it owns the slot just before, so an editor's
+        /// caret can be placed on it.
+        para_start: usize,
     }
 
     let cols = opts.columns.clone();
@@ -1613,6 +1655,9 @@ pub fn layout_mtext(opts: &MTextRenderOpts) -> MTextLayout {
         if para_idx > 0 {
             doc_char_offset += 1;
         }
+        // Where this paragraph starts in the layout's character space; the break
+        // that opened it owns the slot just before it.
+        let para_start_offset = doc_char_offset;
         let mut atoms: Vec<LayoutAtom> = Vec::new();
         for run in &para.runs {
             match &run.kind {
@@ -1766,6 +1811,7 @@ pub fn layout_mtext(opts: &MTextRenderOpts) -> MTextLayout {
                 tab_stops: para.tab_stops.clone(),
                 is_first_in_paragraph: idx == 0,
                 starts_column: idx == 0 && para.starts_column,
+                para_start: para_start_offset,
                 column,
                 // The gap above rides the first wrapped line; the gap below the
                 // last, so an interior wrap keeps normal single spacing.
@@ -1793,6 +1839,7 @@ pub fn layout_mtext(opts: &MTextRenderOpts) -> MTextLayout {
             space_before: 0.0,
             space_after: 0.0,
             line_spacing: None,
+            para_start: 0,
         });
     }
 
@@ -2109,7 +2156,6 @@ pub fn layout_mtext(opts: &MTextRenderOpts) -> MTextLayout {
     let mut v_col: usize = 0;
     let mut line_widths: Vec<f32> = Vec::with_capacity(sub_lines.len());
     let mut glyph_boxes: Vec<GlyphBox> = Vec::new();
-    let mut vis: usize = 0;
     // Transform an entity-local point to world space (mirrors the stroke
     // origin maths) so glyph boxes line up with the drawn glyphs.
     let to_world = |line_base_x: f32, line_base_y: f32, lx: f32, ly: f32| -> (f32, f32) {
@@ -2228,7 +2274,12 @@ pub fn layout_mtext(opts: &MTextRenderOpts) -> MTextLayout {
             let (ax, ay) = to_world(line_base_x, line_base_y, cursor_start, 0.0);
             let (_, by) = to_world(line_base_x, line_base_y, cursor_start, caret_h);
             glyph_boxes.push(GlyphBox {
-                vis,
+                // The break occupies its own slot in the same character space the
+                // glyph atoms are numbered in (`atom.char_offset`), so an editor's
+                // caret index lines up with the boxes. Numbering it from a
+                // separate counter put it on top of the first line's first glyph,
+                // and the caret stuck to the previous line after a break.
+                vis: sub.para_start.saturating_sub(1),
                 xmin: ax,
                 xmax: ax,
                 ymin: ay.min(by),
@@ -2240,8 +2291,8 @@ pub fn layout_mtext(opts: &MTextRenderOpts) -> MTextLayout {
                     line_lx + cursor_start,
                     line_ly + caret_h,
                 ],
+                quad: [(ax, ay), (ax, ay), (ax, by), (ax, by)],
             });
-            vis += 1;
         }
 
         // Justify / distribute fill the line to the content width. `qj` spreads
@@ -2360,7 +2411,6 @@ pub fn layout_mtext(opts: &MTextRenderOpts) -> MTextLayout {
                             local_bounds[1] = local_bounds[1].min(gy0);
                             local_bounds[2] = local_bounds[2].max(gx + run_h);
                             local_bounds[3] = local_bounds[3].max(gy1);
-                            vis += 1;
                             cursor_x += cell;
                         }
                         continue;
@@ -2495,14 +2545,24 @@ pub fn layout_mtext(opts: &MTextRenderOpts) -> MTextLayout {
                                     });
                             for (ci, (x0, x1)) in cells.into_iter().enumerate() {
                                 let (cx0, cx1) = (cursor_x + x0, cursor_x + x1);
-                                let (ax, ay) = to_world(line_base_x, line_base_y, cx0, ly);
-                                let (bx, by) = to_world(line_base_x, line_base_y, cx1, ly + run_h);
+                                let quad = [
+                                    to_world(line_base_x, line_base_y, cx0, ly),
+                                    to_world(line_base_x, line_base_y, cx1, ly),
+                                    to_world(line_base_x, line_base_y, cx1, ly + run_h),
+                                    to_world(line_base_x, line_base_y, cx0, ly + run_h),
+                                ];
                                 glyph_boxes.push(GlyphBox {
                                     vis: atom.char_offset + ci,
-                                    xmin: ax.min(bx),
-                                    xmax: ax.max(bx),
-                                    ymin: ay.min(by),
-                                    ymax: ay.max(by),
+                                    xmin: quad.iter().map(|p| p.0).fold(f32::INFINITY, f32::min),
+                                    xmax: quad
+                                        .iter()
+                                        .map(|p| p.0)
+                                        .fold(f32::NEG_INFINITY, f32::max),
+                                    ymin: quad.iter().map(|p| p.1).fold(f32::INFINITY, f32::min),
+                                    ymax: quad
+                                        .iter()
+                                        .map(|p| p.1)
+                                        .fold(f32::NEG_INFINITY, f32::max),
                                     is_rtl: true,
                                     local: [
                                         line_lx + cx0,
@@ -2510,6 +2570,7 @@ pub fn layout_mtext(opts: &MTextRenderOpts) -> MTextLayout {
                                         line_lx + cx1,
                                         line_ly + ly + run_h,
                                     ],
+                                    quad,
                                 });
                             }
                         } else {
@@ -2534,14 +2595,24 @@ pub fn layout_mtext(opts: &MTextRenderOpts) -> MTextLayout {
                                         Some(&(x0, x1)) => (cursor_x + x0, cursor_x + x1),
                                         None => (cx, cx + adv),
                                     };
-                                let (ax, ay) = to_world(line_base_x, line_base_y, cx0, ly);
-                                let (bx, by) = to_world(line_base_x, line_base_y, cx1, ly + run_h);
+                                let quad = [
+                                    to_world(line_base_x, line_base_y, cx0, ly),
+                                    to_world(line_base_x, line_base_y, cx1, ly),
+                                    to_world(line_base_x, line_base_y, cx1, ly + run_h),
+                                    to_world(line_base_x, line_base_y, cx0, ly + run_h),
+                                ];
                                 glyph_boxes.push(GlyphBox {
                                     vis: atom.char_offset + ci,
-                                    xmin: ax.min(bx),
-                                    xmax: ax.max(bx),
-                                    ymin: ay.min(by),
-                                    ymax: ay.max(by),
+                                    xmin: quad.iter().map(|p| p.0).fold(f32::INFINITY, f32::min),
+                                    xmax: quad
+                                        .iter()
+                                        .map(|p| p.0)
+                                        .fold(f32::NEG_INFINITY, f32::max),
+                                    ymin: quad.iter().map(|p| p.1).fold(f32::INFINITY, f32::min),
+                                    ymax: quad
+                                        .iter()
+                                        .map(|p| p.1)
+                                        .fold(f32::NEG_INFINITY, f32::max),
                                     is_rtl: false,
                                     local: [
                                         line_lx + cx0,
@@ -2549,6 +2620,7 @@ pub fn layout_mtext(opts: &MTextRenderOpts) -> MTextLayout {
                                         line_lx + cx1,
                                         line_ly + ly + run_h,
                                     ],
+                                    quad,
                                 });
                                 cx += adv;
                             }
@@ -2678,6 +2750,14 @@ pub fn layout_mtext(opts: &MTextRenderOpts) -> MTextLayout {
                                         line_lx + x1,
                                         line_ly + top,
                                     ],
+                                    // corners: [BL, BR, TL, TR] — quad keeps
+                                    // cell-local reading order [BL, BR, TR, TL].
+                                    quad: [
+                                        corners[0],
+                                        corners[1],
+                                        corners[3],
+                                        corners[2],
+                                    ],
                                 });
                             }
                         }
@@ -2781,14 +2861,24 @@ pub fn layout_mtext(opts: &MTextRenderOpts) -> MTextLayout {
                     }
                     if opts.want_glyph_boxes {
                         let run_h = atom.state.height_mul * entity_h;
-                        let (ax, ay) = to_world(line_base_x, line_base_y, cursor_x, 0.0);
-                        let (bx, by) = to_world(line_base_x, line_base_y, cursor_x + adv, run_h);
+                        let quad = [
+                            to_world(line_base_x, line_base_y, cursor_x, 0.0),
+                            to_world(line_base_x, line_base_y, cursor_x + adv, 0.0),
+                            to_world(line_base_x, line_base_y, cursor_x + adv, run_h),
+                            to_world(line_base_x, line_base_y, cursor_x, run_h),
+                        ];
                         glyph_boxes.push(GlyphBox {
                             vis: atom.char_offset,
-                            xmin: ax.min(bx),
-                            xmax: ax.max(bx),
-                            ymin: ay.min(by),
-                            ymax: ay.max(by),
+                            xmin: quad.iter().map(|p| p.0).fold(f32::INFINITY, f32::min),
+                            xmax: quad
+                                .iter()
+                                .map(|p| p.0)
+                                .fold(f32::NEG_INFINITY, f32::max),
+                            ymin: quad.iter().map(|p| p.1).fold(f32::INFINITY, f32::min),
+                            ymax: quad
+                                .iter()
+                                .map(|p| p.1)
+                                .fold(f32::NEG_INFINITY, f32::max),
                             is_rtl: false,
                             local: [
                                 line_lx + cursor_x,
@@ -2796,6 +2886,7 @@ pub fn layout_mtext(opts: &MTextRenderOpts) -> MTextLayout {
                                 line_lx + cursor_x + adv,
                                 line_ly + run_h,
                             ],
+                            quad,
                         });
                     }
                     cursor_x += adv;

@@ -3971,6 +3971,11 @@ impl OpenCADStudio {
         if self.refuse_block_test_save(self.active_tab) {
             return Task::none();
         }
+        // An open cell editor blanks the cell's text in the drawing so only the
+        // live surface shows it. Writing that blank to disk would erase the cell,
+        // so the edit is settled first — which also puts the text back when the
+        // user changed nothing.
+        self.settle_table_cell_edit();
         if self.read_only {
             self.command_line.push_error(
                 crate::t!("Read-only session (--read-only): saving is disabled.").as_ref(),
@@ -4412,6 +4417,11 @@ impl OpenCADStudio {
     /// touches the original file or the dirty flag.
     #[cfg(not(target_arch = "wasm32"))]
     pub(super) fn on_autosave(&mut self) -> Task<Message> {
+        // An open cell editor keeps its cell's text blanked in the picture
+        // block, and the tab may already be dirty from an earlier edit — the
+        // dirty check below would then let the recovery copy write that blank.
+        // Settle first: the snapshot captures the edited text like a save does.
+        self.settle_table_cell_edit();
         let mut tasks = Vec::new();
         for i in 0..self.tabs.len() {
             if self.tabs[i].block_test.is_some()
@@ -4450,6 +4460,9 @@ impl OpenCADStudio {
         if self.web_autosave_in_flight || self.pending_web_thumbnail_save.is_some() {
             return Task::none();
         }
+        // Same as native: an open cell editor blanks its cell in the picture
+        // block, so the OPFS snapshot must not run while the blank stands.
+        self.settle_table_cell_edit();
         let mut pending = Vec::new();
         for i in 0..self.tabs.len() {
             if self.tabs[i].block_test.is_some() || !self.tabs[i].dirty {

@@ -1,4 +1,5 @@
 use super::super::Message;
+use super::text_surface::{SurfaceClicks, TextSurface};
 use crate::t;
 use crate::ui::popup::context_menu::{
     ContextMenu, MenuIcon, MenuItem, MenuRow, MENU_PAD_TOP, MENU_ROW_H,
@@ -74,12 +75,16 @@ pub(super) fn text_inline_overlay(
     position_canvas_overlay(anchor, panel.into())
 }
 
-/// Screen rectangle of the cell the open table cell editor is working on, or
-/// `None` when no cell editor is up or the cell cannot be projected.
-pub(super) fn table_cell_edit_rect(app: &super::super::OpenCADStudio) -> Option<iced::Rectangle> {
-    let mark = app.table_cell_edit?;
+/// Screen rectangle of one table cell, or `None` when it cannot be projected in
+/// the space being edited.
+pub(in crate::app) fn table_cell_edit_rect(
+    app: &super::super::OpenCADStudio,
+    handle: codec::Handle,
+    row: usize,
+    column: usize,
+) -> Option<iced::Rectangle> {
     let scene = &app.tabs[app.active_tab].scene;
-    let table = match scene.document.get_entity(mark.handle)? {
+    let table = match scene.document.get_entity(handle)? {
         codec::EntityType::Table(table) => table,
         _ => return None,
     };
@@ -90,8 +95,11 @@ pub(super) fn table_cell_edit_rect(app: &super::super::OpenCADStudio) -> Option<
             codec::objects::ObjectType::TableStyle(style) => Some(style),
             _ => None,
         });
-    let corners =
-        crate::modules::annotate::table_cmd::cell_rect_world(table, style, mark.row, mark.column)?;
+    // TODO(tables): the cell's screen rectangle is the axis-aligned box of its
+    // projected corners, so a rotated table gets a slightly wrong overlay; the
+    // committed data is right (only the live drawing is off). Mapping the surface
+    // through the projected axes instead of an AABB is the fix.
+    let corners = crate::modules::annotate::table_cmd::cell_rect_world(table, style, row, column)?;
     let (vp_w, vp_h) = scene.selection.borrow().view.vp_size;
     if vp_w <= 1.0 || vp_h <= 1.0 {
         return None;
@@ -153,23 +161,75 @@ pub(super) fn table_cell_edit_rect(app: &super::super::OpenCADStudio) -> Option<
     })
 }
 
-/// Outline around the cell being edited (the open cell editor's target).
-pub(super) fn table_cell_edit_overlay(rect: iced::Rectangle) -> Element<'static, Message> {
-    let panel = container(Space::new())
-        .width(Length::Fixed(rect.width))
-        .height(Length::Fixed(rect.height))
-        .style(|theme: &Theme| {
-            let palette = theme.palette();
-            container::Style {
-                border: Border {
-                    color: palette.primary.base.color,
-                    width: 2.0,
-                    radius: 2.0.into(),
-                },
-                ..Default::default()
-            }
-        });
-    position_canvas_overlay(iced::Point::new(rect.x, rect.y), panel.into())
+/// In-place table cell editor: the edited text, drawn by the shared surface in
+/// the cell's own style and place, over an invisible focused sink that owns the
+/// keystrokes.
+pub(super) fn table_cell_edit_overlay<'a>(
+    ed: &'a super::super::table_cell_edit::TableCellEditState,
+    rect: iced::Rectangle,
+) -> Element<'a, Message> {
+    // The drawing pans and zooms under the editor, so the geometry is taken from
+    // the cell's CURRENT screen rectangle on every frame instead of the one the
+    // editor opened with — otherwise the overlay stays glued to the window while
+    // the sheet slides away beneath it.
+    let screen = ed.screen(rect);
+    let (width, height) = (screen.paint.width.max(1.0), screen.paint.height.max(1.0));
+    let surface = TextSurface {
+        pad: 0.0,
+        cell_frame: Some(ed.cell_world),
+        segments: segments_from_wires(&ed.wires),
+        boxes: ed.boxes.clone(),
+        sel: None,
+        caret: ed.caret,
+        caret_on: ed.caret_blink_on,
+        caret_color: Some(ed.ink),
+        clicks: SurfaceClicks::TableCell,
+        minx: screen.minx,
+        miny: screen.miny,
+        scale: screen.scale,
+        content_h: height,
+        // No wrap ruler in the cell editor: the cell's own frame is the ruler.
+        wrap_width_px: 0.0,
+    };
+    let glyphs = iced::widget::canvas(surface)
+        .width(Length::Fixed(width))
+        .height(Length::Fixed(height));
+    // The keyboard sink: focused, but invisible — the surface draws the text and
+    // the caret, so the sink's own are transparent and it sits in the corner.
+    let sink = iced::widget::text_editor(&ed.content)
+        .id(iced::widget::Id::new(
+            super::super::table_cell_edit::TABLE_CELL_SINK_ID,
+        ))
+        .on_action(Message::TableCellEditAction)
+        .padding(0)
+        .size(1.0)
+        .width(1.0)
+        .height(1.0)
+        .style(
+            |_theme: &Theme, _status: iced::widget::text_editor::Status| {
+                iced::widget::text_editor::Style {
+                    background: Background::Color(Color::TRANSPARENT),
+                    border: Border::default(),
+                    placeholder: Color::TRANSPARENT,
+                    value: Color::TRANSPARENT,
+                    selection: Color::TRANSPARENT,
+                }
+            },
+        );
+    let panel = container(
+        iced::widget::stack![glyphs, sink]
+            .width(Length::Fixed(width))
+            .height(Length::Fixed(height)),
+    )
+    .width(Length::Fixed(width))
+    .height(Length::Fixed(height))
+    // No background: the editor blanks the table's own text for the cell, so
+    // there is nothing left to paint over and the live glyphs are never masked.
+    .style(|_theme: &Theme| container::Style::default());
+    position_canvas_overlay(
+        iced::Point::new(screen.paint.x, screen.paint.y),
+        panel.into(),
+    )
 }
 
 // Stroke-font families bundled with the renderer; see scene/lff.rs.
@@ -196,241 +256,24 @@ const MTEXT_EDITOR_FALLBACK_WIDTH: f32 = 660.0;
 pub(in crate::app) const MTEXT_EDITOR_WRITING_WIDTH: f32 =
     MTEXT_EDITOR_FALLBACK_WIDTH - 2.0 * MTEXT_PREVIEW_PAD;
 
-struct MTextPreview {
-    /// Disconnected polylines as (x, y) world points + colour (NaN-split done).
-    segments: Vec<(Vec<(f32, f32)>, Color, f32)>,
-    /// Per-visible-character boxes (world frame) for click-to-select.
-    boxes: Vec<crate::entities::text_support::GlyphBox>,
-    /// Current selection as a visible-char range.
-    sel: Option<(usize, usize)>,
-    /// Caret position as a visible-char offset.
-    caret: usize,
-    /// Whether the caret is in its visible blink phase.
-    caret_on: bool,
-    /// World-space min corner (bbox) and pixels-per-world-unit scale.
-    minx: f32,
-    miny: f32,
-    scale: f32,
-    content_h: f32,
-    /// On-screen width of the MText wrapping rectangle.
-    wrap_width_px: f32,
-}
-
-impl MTextPreview {
-    /// Visible-char offset (0..=N) nearest the cursor point (bounds-local px).
-    fn offset_at(&self, p: iced::Point) -> usize {
-        if self.boxes.is_empty() {
-            return 0;
-        }
-        let wx = self.minx + (p.x - MTEXT_PREVIEW_PAD) / self.scale;
-        let wy = self.miny + (self.content_h - p.y - MTEXT_PREVIEW_PAD) / self.scale;
-        let mut best = 0usize;
-        let mut best_d = f32::MAX;
-        for b in &self.boxes {
-            let dx = if wx < b.xmin {
-                b.xmin - wx
-            } else if wx > b.xmax {
-                wx - b.xmax
-            } else {
-                0.0
-            };
-            let dy = if wy < b.ymin {
-                b.ymin - wy
-            } else if wy > b.ymax {
-                wy - b.ymax
-            } else {
-                0.0
-            };
-            let d = dy * 1000.0 + dx; // prefer the correct line first
-            if d < best_d {
-                best_d = d;
-                if b.is_rtl {
-                    if wx < (b.xmin + b.xmax) * 0.5 {
-                        best = b.vis + 1;
-                    } else {
-                        best = b.vis;
-                    }
-                } else {
-                    best = b.vis;
-                    // After the glyph centre → caret sits after this char.
-                    if wx > (b.xmin + b.xmax) * 0.5 {
-                        best = b.vis + 1;
-                    }
-                }
-            }
-        }
-        best
-    }
-}
-
-#[derive(Default)]
-struct MTextPreviewState {
-    dragging: bool,
-}
-
-impl iced::widget::canvas::Program<Message> for MTextPreview {
-    type State = MTextPreviewState;
-
-    fn update(
-        &self,
-        state: &mut MTextPreviewState,
-        event: &iced::Event,
-        bounds: iced::Rectangle,
-        cursor: iced::mouse::Cursor,
-    ) -> Option<iced::widget::canvas::Action<Message>> {
-        use iced::mouse::{Button, Event as Me};
-        use iced::widget::canvas::Action;
-        use iced::Event;
-        match event {
-            Event::Mouse(Me::ButtonPressed(Button::Left)) => {
-                if let Some(p) = cursor.position_in(bounds) {
-                    state.dragging = true;
-                    let off = self.offset_at(p);
-                    return Some(Action::publish(Message::MTextSelStart(off)).and_capture());
-                }
-            }
-            Event::Mouse(Me::CursorMoved { .. }) => {
-                if state.dragging {
-                    if let Some(p) = cursor.position_in(bounds) {
-                        let off = self.offset_at(p);
-                        return Some(Action::publish(Message::MTextSelTo(off)));
-                    }
-                }
-            }
-            Event::Mouse(Me::ButtonReleased(Button::Left)) => {
-                if state.dragging {
-                    state.dragging = false;
-                    return Some(Action::capture());
-                }
-            }
-            _ => {}
-        }
-        None
-    }
-
-    fn draw(
-        &self,
-        _state: &MTextPreviewState,
-        renderer: &iced::Renderer,
-        theme: &Theme,
-        bounds: iced::Rectangle,
-        _cursor: iced::mouse::Cursor,
-    ) -> Vec<iced::widget::canvas::Geometry> {
-        use iced::widget::canvas::{Frame, Path, Stroke};
-        let mut frame = Frame::new(renderer, bounds.size());
-        let pad = MTEXT_PREVIEW_PAD;
-        // Draw at the real size; flip Y (world up → screen down).
-        let map = |x: f32, y: f32| {
-            iced::Point::new(
-                pad + (x - self.minx) * self.scale,
-                self.content_h - (pad + (y - self.miny) * self.scale),
-            )
-        };
-        // Wrap ruler: same screen-space position as the width slider handle.
-        let wrap_x = (pad + self.wrap_width_px).clamp(pad, bounds.width.max(pad));
-        let wrap_line = Path::new(|path| {
-            path.move_to(iced::Point::new(wrap_x, 0.0));
-            path.line_to(iced::Point::new(wrap_x, self.content_h));
-        });
-        frame.stroke(
-            &wrap_line,
-            Stroke::default()
-                .with_color(theme.palette().primary.base.color.scale_alpha(0.65))
-                .with_width(1.0),
-        );
-        // Selection highlight behind the glyphs.
-        if let Some((a, b)) = self.sel {
-            for bx in &self.boxes {
-                if bx.vis >= a && bx.vis < b {
-                    let p0 = map(bx.xmin, bx.ymax);
-                    let p1 = map(bx.xmax, bx.ymin);
-                    let rect = Path::rectangle(
-                        iced::Point::new(p0.x.min(p1.x), p0.y.min(p1.y)),
-                        iced::Size::new((p1.x - p0.x).abs(), (p1.y - p0.y).abs()),
-                    );
-                    frame.fill(&rect, theme.palette().primary.base.color.scale_alpha(0.45));
-                }
-            }
-        }
-        for (seg, col, width) in &self.segments {
-            if seg.len() < 2 {
-                continue;
-            }
-            let path = Path::new(|p| {
-                p.move_to(map(seg[0].0, seg[0].1));
-                for &(x, y) in &seg[1..] {
-                    p.line_to(map(x, y));
-                }
-            });
-            frame.stroke(&path, Stroke::default().with_color(*col).with_width(*width));
-        }
-        // Caret — a vertical bar at the caret's glyph boundary, shown when the
-        // selection is empty (a plain text cursor).
-        // Caret is shown only when the selection is empty and the blink is in
-        // its visible phase.
-        let collapsed = self.caret_on && self.sel.map(|(a, b)| a == b).unwrap_or(true);
-        if collapsed && self.boxes.is_empty() {
-            // Empty text: show a caret at the top-left so the user can type.
-            // Its height matches the preview's constant em (see EM_PX) so the
-            // empty-editor caret isn't tiny.
-            let path = Path::new(|p| {
-                p.move_to(iced::Point::new(MTEXT_PREVIEW_PAD, MTEXT_PREVIEW_PAD));
-                p.line_to(iced::Point::new(
-                    MTEXT_PREVIEW_PAD,
-                    (MTEXT_PREVIEW_PAD + 40.0).min(self.content_h),
-                ));
-            });
-            frame.stroke(
-                &path,
-                Stroke::default()
-                    .with_color(theme.palette().warning.base.color)
-                    .with_width(1.5),
-            );
-        } else if collapsed {
-            let bar = if let Some(b) = self.boxes.iter().find(|b| b.vis == self.caret) {
-                let cx = if b.is_rtl { b.xmax } else { b.xmin };
-                Some((cx, b.ymin, b.ymax))
-            } else if self.caret > 0 {
-                self.boxes
-                    .iter()
-                    .find(|b| b.vis == self.caret - 1)
-                    .map(|b| {
-                        let cx = if b.is_rtl { b.xmin } else { b.xmax };
-                        (cx, b.ymin, b.ymax)
-                    })
-            } else {
-                self.boxes.first().map(|b| {
-                    let cx = if b.is_rtl { b.xmax } else { b.xmin };
-                    (cx, b.ymin, b.ymax)
-                })
-            };
-            if let Some((cx, y0, y1)) = bar {
-                let p0 = map(cx, y0);
-                let p1 = map(cx, y1);
-                let path = Path::new(|p| {
-                    p.move_to(p0);
-                    p.line_to(p1);
-                });
-                frame.stroke(
-                    &path,
-                    Stroke::default()
-                        .with_color(theme.palette().warning.base.color)
-                        .with_width(1.5),
-                );
-            }
-        }
-        vec![frame.into_geometry()]
-    }
-}
-
 /// Split every preview WireModel into finite (x, y) polyline runs, each
 /// carrying its wire's colour (so inline `\C` / the colour dropdown shows) and a
 /// stroke width (bold runs carry a wider pen via `line_weight_px`).
 fn mtext_preview_segments(
     ed: &super::super::mtext_editor::MTextEditorState,
 ) -> Vec<(Vec<(f32, f32)>, Color, f32)> {
+    segments_from_wires(&ed.preview_wires)
+}
+
+/// Split every preview WireModel into finite (x, y) polyline runs, each
+/// carrying its wire's colour (so inline `\C` / the colour dropdown shows) and a
+/// stroke width (bold runs carry a wider pen via `line_weight_px`). Shared by
+/// every surface that draws tessellated text (`TextSurface`).
+pub(in crate::app) fn segments_from_wires(
+    wires: &[crate::scene::WireModel],
+) -> Vec<(Vec<(f32, f32)>, Color, f32)> {
     let mut out: Vec<(Vec<(f32, f32)>, Color, f32)> = Vec::new();
-    for w in &ed.preview_wires {
+    for w in wires {
         let col = Color {
             r: w.color[0],
             g: w.color[1],
@@ -927,12 +770,16 @@ fn mtext_editor_content<'a>(
         } else {
             ed.rect_width as f32 * scale + 2.0 * MTEXT_PREVIEW_PAD
         };
-        let prog = MTextPreview {
+        let prog = TextSurface {
+            pad: MTEXT_PREVIEW_PAD,
+            cell_frame: None,
             segments,
             boxes: ed.glyph_boxes.clone(),
             sel: ed.sel,
             caret: ed.caret,
             caret_on: ed.caret_blink_on,
+            caret_color: None,
+            clicks: SurfaceClicks::MText,
             minx,
             miny,
             scale,

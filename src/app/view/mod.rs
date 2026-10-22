@@ -186,6 +186,7 @@ use std::sync::Arc;
 mod controls;
 mod modal;
 pub(in crate::app) mod overlay;
+mod text_surface;
 mod viewcube;
 
 use controls::{dyn_component_value, viewport_controls};
@@ -2352,8 +2353,18 @@ bg={bg_ms:.1}ms n={view_count}"
                 34.0 + self.command_line.overlay_lines_height()
             };
             if !tab.is_start {
-                if let Some(rect) = overlay::table_cell_edit_rect(self) {
-                    viewport_stack = viewport_stack.push(overlay::table_cell_edit_overlay(rect));
+                if let Some(cell) = self.table_cell_edit.as_ref() {
+                    // Follow the cell: panning and zooming move it under the
+                    // overlay, so its screen rectangle is recomputed here.
+                    if let Some(rect) = overlay::table_cell_edit_rect(
+                        self,
+                        cell.handle,
+                        cell.row,
+                        cell.column,
+                    ) {
+                        viewport_stack =
+                            viewport_stack.push(overlay::table_cell_edit_overlay(cell, rect));
+                    }
                 }
                 if let Some(readout) = self.measurement_readout(self.active_tab) {
                     viewport_stack = viewport_stack.push(overlay::measurement_overlay(
@@ -3128,8 +3139,9 @@ impl OpenCADStudio {
         } else {
             Subscription::none()
         };
-        // Blink the MText preview caret while the editor is open.
-        let caret_blink = if self.mtext_editor.is_some() {
+        // Blink the text caret while an editor with a caret is open (the MText
+        // editor or an in-place table cell).
+        let caret_blink = if self.mtext_editor.is_some() || self.table_cell_edit.is_some() {
             iced::time::every(std::time::Duration::from_millis(530))
                 .map(|_| Message::MTextCaretBlink)
         } else {
@@ -3196,6 +3208,24 @@ impl OpenCADStudio {
         // While a shortcut-editor Key cell is armed for capture, a dedicated
         // listener records the pressed combination and swallows every other
         // key so captured shortcuts do not run in the drawing.
+        // The cell editor needs the Shift state: iced reports Enter the same way
+        // with or without it, while Enter commits the cell and Shift+Enter types
+        // a line break.
+        let cell_shift = if self.table_cell_edit.is_some() {
+            event::listen_with(|event, _status, _window| match event {
+                iced::Event::Keyboard(keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Named(keyboard::key::Named::Shift),
+                    ..
+                }) => Some(Message::TableCellShift(true)),
+                iced::Event::Keyboard(keyboard::Event::KeyReleased {
+                    key: keyboard::Key::Named(keyboard::key::Named::Shift),
+                    ..
+                }) => Some(Message::TableCellShift(false)),
+                _ => None,
+            })
+        } else {
+            Subscription::none()
+        };
         let keyboard_events = if self.shortcut_capture_row.is_some() {
             event::listen_with(shortcut_capture_key_event)
         } else {
@@ -3422,12 +3452,21 @@ impl OpenCADStudio {
             sheet_set_poll,
             single_instance,
             hatch_pattern_keys,
+            cell_shift,
             keyboard_events,
             ui_font_changes(),
         ])
     }
 
     pub(super) fn focus_cmd_input(&self) -> Task<Message> {
+        // While a cell is open AND the user last put the keyboard there, ambient
+        // refocus (a command step finishing, a panel closing, a click) hands it
+        // back to the cell. Once the user types into the command line, ownership
+        // moves there and this leaves it alone — so the command line stays
+        // reachable instead of being locked out by the open editor.
+        if self.table_cell_edit.is_some() && self.cell_keyboard {
+            return crate::app::table_cell_edit::focus_sink();
+        }
         iced::widget::operation::focus(iced::widget::Id::new(crate::ui::command_line::CMD_INPUT_ID))
     }
 

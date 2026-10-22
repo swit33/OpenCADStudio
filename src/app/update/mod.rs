@@ -696,6 +696,18 @@ impl OpenCADStudio {
             return self.select_remembered_session_tab();
         }
         self.sync_open_command_history();
+        // The cell editor holds a handle into the document it opened in and keeps
+        // that cell's text blanked there. If the user has moved to another
+        // drawing since (tab switch, file open, restore), the editor no longer
+        // belongs to what is on screen: close it where it lives. One guard here
+        // covers every path that changes the active tab.
+        if self
+            .table_cell_edit
+            .as_ref()
+            .is_some_and(|ed| ed.tab_id != self.tabs[self.active_tab].id)
+        {
+            self.table_cell_cancel();
+        }
         // Close the document-level first-touch transaction started by
         // push_undo_snapshot at this message boundary.
         self.finish_all_pending_history();
@@ -2448,6 +2460,10 @@ impl OpenCADStudio {
             Message::SaveFile => self.on_save_file(),
 
             Message::SaveAs => {
+                // An open cell editor blanks the cell's text in the drawing so
+                // only the live surface shows it: settle it before the save
+                // dialog can write that blank.
+                self.settle_table_cell_edit();
                 if self.read_only {
                     self.command_line.push_error(
                         crate::t!("Read-only session (--read-only): saving is disabled.").as_ref(),
@@ -2642,6 +2658,10 @@ impl OpenCADStudio {
                         // The attribute editor is tab-scoped; leaving its tab
                         // drops it (its handle is that document's, not this one's).
                         self.cancel_attr_editor();
+                        // The cell editor is the same: its handle belongs to the
+                        // tab being left, and it keeps that cell's text blanked
+                        // there. Leaving it open would type into another drawing.
+                        self.table_cell_cancel();
                         // Persist the outgoing drawing's Ortho / running OSNAP
                         // before leaving it, so switching back restores them.
                         let prev = self.active_tab;
@@ -2840,6 +2860,10 @@ impl OpenCADStudio {
             }
 
             Message::CommandInput(s) => {
+                // The user is typing into the command line, so the keyboard is
+                // theirs: an open cell editor stops claiming ambient focus back
+                // (see `focus_cmd_input`). Clicking the cell's text returns it.
+                self.cell_keyboard = false;
                 // Space submits (acts like Enter) so a command advances
                 // token-by-token, matching CAD convention. A leading `>` switches
                 // to literal-space mode so an argument containing spaces (a text
@@ -7235,6 +7259,29 @@ impl OpenCADStudio {
                 if let Some(ed) = self.mtext_editor.as_mut() {
                     ed.caret_blink_on = !ed.caret_blink_on;
                 }
+                if let Some(ed) = self.table_cell_edit.as_mut() {
+                    ed.caret_blink_on = !ed.caret_blink_on;
+                }
+                Task::none()
+            }
+            Message::TableCellEditAction(action) => {
+                self.table_cell_edit_action(action);
+                Task::none()
+            }
+            Message::TableCellShift(down) => {
+                self.table_cell_shift = down;
+                Task::none()
+            }
+            Message::TableCellSelStart(slot) => {
+                self.table_cell_set_caret(slot);
+                // Clicking the cell's text takes the keyboard back from the command
+                // line: the typing goes through the sink, which is re-focused and
+                // never unfocused the way the MText modal does it.
+                self.cell_keyboard = true;
+                crate::app::table_cell_edit::focus_sink()
+            }
+            Message::TableCellSelTo(slot) => {
+                self.table_cell_set_caret(slot);
                 Task::none()
             }
             Message::MTextOk => {
@@ -10955,6 +11002,14 @@ impl OpenCADStudio {
             Message::PspaceCommand => Task::done(Message::ExitViewport),
 
             Message::Undo => {
+                // While a cell is being edited, Ctrl+Z belongs to the cell: the
+                // focused sink publishes its own `Edit::Undo` for the same
+                // keystroke, so running the document undo here as well would take
+                // back a character inside the cell AND a step of the drawing on
+                // one press.
+                if self.table_cell_edit.is_some() {
+                    return Task::none();
+                }
                 // Mid-command Ctrl+Z: a drawing command steps itself back
                 // (PLINE pops the last vertex) instead of the document undo
                 // swallowing the whole in-progress object.
@@ -10970,6 +11025,9 @@ impl OpenCADStudio {
                 Task::none()
             }
             Message::Redo => {
+                if self.table_cell_edit.is_some() {
+                    return Task::none();
+                }
                 self.redo_active_tab();
                 Task::none()
             }
@@ -12979,57 +13037,12 @@ mod dock_visibility_tests {
 
 #[cfg(test)]
 mod free_text_entry_tests {
-    //! The free-form text prompts (table cell content, TEXT / MTEXT bodies)
-    //! change what Space / Enter / typing mean at the command line. These
-    //! tests pin the routing through `text_entry_mode` so the three key
-    //! routes can't drift apart again.
+    //! The free-form text prompts (attribute values, plugin names — the ones
+    //! that take letter casing and spaces from the command line) change what
+    //! Space / Enter / typing mean at the command line. These tests pin the
+    //! routing through `text_entry_mode` so the key routes can't drift apart.
     use super::Message;
     use crate::app::{OpenCADStudio, TextEntryMode};
-    use crate::modules::annotate::table_cmd::TableCellEditCommand;
-    use codec::entities::Table;
-    use codec::types::Vector3;
-    use codec::{EntityType, Handle};
-
-    /// A test drawing with a 2×2 table and the cell editor active on [0,0],
-    /// seeded with `cell_text`.
-    fn app_with_cell_command(cell_text: &str) -> (OpenCADStudio, Handle) {
-        let mut app = OpenCADStudio::new_for_test();
-        app.automation_op(r#"{"op":"new"}"#);
-        let mut table = Table::new(Vector3::new(0.0, 0.0, 0.0), 2, 2);
-        table.cell_mut(0, 0).unwrap().set_text(cell_text);
-        let handle = app.tabs[0]
-            .scene
-            .document
-            .add_entity(EntityType::Table(Box::new(table.clone())))
-            .unwrap();
-        app.set_active_command(0, Box::new(TableCellEditCommand::new(handle, &table, 0, 0)));
-        (app, handle)
-    }
-
-    fn cell_text(app: &OpenCADStudio, _handle: Handle) -> String {
-        // ReplaceMany commits by erasing the old handle and re-adding the
-        // entity under a new one, so look the (single) table up by type.
-        app.tabs[0]
-            .scene
-            .document
-            .entities()
-            .find_map(|e| match e {
-                EntityType::Table(table) => Some(table.cell_text(0, 0).unwrap_or("").to_string()),
-                _ => None,
-            })
-            .expect("table entity missing")
-    }
-
-    #[test]
-    fn cell_editor_switches_to_free_text_mode() {
-        let (mut app, _) = app_with_cell_command("");
-        assert_eq!(app.text_entry_mode(), TextEntryMode::FreeText);
-        assert!(app.is_free_text_active());
-        app.tabs[0].active_cmd = None;
-        assert_eq!(app.text_entry_mode(), TextEntryMode::Command);
-        assert!(!app.is_free_text_active());
-    }
-
     #[test]
     fn pasted_spreadsheet_rows_enter_one_point_each() {
         let mut app = OpenCADStudio::new_for_test();
@@ -13051,67 +13064,6 @@ mod free_text_entry_tests {
             })
             .expect("the pasted rows drew a polyline");
         assert_eq!(points, vec![(1.0, 4.0), (2.0, 6.0), (3.0, 1.0), (4.0, 4.0)]);
-    }
-
-    #[test]
-    fn cell_edit_typed_space_stays_in_buffer_with_case() {
-        let (mut app, handle) = app_with_cell_command("");
-        // A typed buffer containing a Space must not auto-submit.
-        let _ = app.update(Message::CommandInput("Foo Bar".into()));
-        assert_eq!(app.command_line.input, "Foo Bar");
-        assert!(app.tabs[0].active_cmd.is_some(), "Space must not submit");
-        // The Space key binding inserts a literal space too.
-        let _ = app.update(Message::CommandSpace);
-        assert_eq!(app.command_line.input, "Foo Bar ");
-        // Enter finishes the edit and commits the content, case intact.
-        let _ = app.update(Message::CommandSubmit);
-        assert_eq!(cell_text(&app, handle), "Foo Bar");
-    }
-
-    #[test]
-    fn cell_edit_slash_n_inserts_line_break() {
-        let (mut app, handle) = app_with_cell_command("");
-        let _ = app.update(Message::CommandInput("Foo/nBar".into()));
-        let _ = app.update(Message::CommandSubmit);
-        assert_eq!(cell_text(&app, handle), "Foo\\PBar");
-    }
-
-    #[test]
-    fn cell_edit_unfocused_typing_preserves_case() {
-        // The CommandAppendChar route (typing while the command line is not
-        // focused) must not uppercase free-form text either.
-        let (mut app, handle) = app_with_cell_command("");
-        for ch in ["F", "o", "o"] {
-            let _ = app.update(Message::CommandAppendChar(ch.into()));
-        }
-        let _ = app.update(Message::CommandSubmit);
-        assert_eq!(cell_text(&app, handle), "Foo");
-    }
-
-    #[test]
-    fn cell_edit_skips_expression_evaluation() {
-        let (mut app, handle) = app_with_cell_command("");
-        let _ = app.update(Message::CommandInput("5*2".into()));
-        let _ = app.update(Message::CommandSubmit);
-        assert_eq!(cell_text(&app, handle), "5*2");
-    }
-
-    #[test]
-    fn cell_edit_leading_greater_than_is_content() {
-        // `>` is only a literal-space hint for command prompts; in free
-        // text it is content and must not be stripped on submit.
-        let (mut app, handle) = app_with_cell_command("");
-        let _ = app.update(Message::CommandInput(">Note".into()));
-        let _ = app.update(Message::CommandSubmit);
-        assert_eq!(cell_text(&app, handle), ">Note");
-    }
-
-    #[test]
-    fn cell_edit_empty_enter_ends_edit_without_wiping() {
-        let (mut app, handle) = app_with_cell_command("Keep me");
-        let _ = app.update(Message::CommandSubmit);
-        assert_eq!(cell_text(&app, handle), "Keep me");
-        assert!(app.tabs[0].active_cmd.is_none(), "Enter ends the edit");
     }
 
     #[test]
@@ -13188,7 +13140,16 @@ mod free_text_entry_tests {
         // instead of falling through to the command line's CommandSpace
         // (space-insert) behavior. FreeText mode distinguishes the two: a
         // COMMANDSPACE would insert a space, while FINALIZE finishes the edit.
-        let (mut app, _) = app_with_cell_command("");
+        let mut app = OpenCADStudio::new_for_test();
+        app.automation_op(r#"{"op":"new"}"#);
+        // Any free-text prompt: spaces and casing belong to the value here.
+        app.set_active_command(
+            0,
+            Box::new(crate::command::FreeTextValuePromptCommand::new(
+                "FREETEXTPROBE",
+                "Value:",
+            )),
+        );
         assert_eq!(app.text_entry_mode(), TextEntryMode::FreeText);
 
         // Bind SPACE to FINALIZE (the CUI assignment from the issue).

@@ -299,7 +299,7 @@ impl MTextEditorState {
         let mut doc = parse_mtext(&raw, true);
         // parse_mtext drops a trailing empty paragraph; restore it so Enter at
         // the end keeps its new (empty) line.
-        if content_has_trailing_break(&raw) {
+        if ends_with_break(&raw) {
             doc.paragraphs.push(MTextParagraph::new());
         }
         self.apply_globals(&mut doc);
@@ -387,7 +387,7 @@ fn parse_non_default(s: &str, default: f64) -> Option<f64> {
 /// (trivial), and rebuilds a structured `MTextDocument`; the flat index IS the
 /// caret index, so caret/selection stay verbatim.
 #[derive(Clone, Debug, PartialEq)]
-enum Cell {
+pub(crate) enum Cell {
     /// A visible character carrying its span's formatting. Tabs count as a
     /// normal char here (one slot), matching the previous caret model.
     Char(char, SpanProperties),
@@ -414,7 +414,7 @@ impl Cell {
 }
 
 /// The flattened `num<sep>den` glyphs of a stacking span, in reading order.
-fn flatten_stack(st: &StackingData) -> String {
+pub(crate) fn flatten_stack(st: &StackingData) -> String {
     let sep = match st.stacking_type {
         StackingType::Limit => '^',
         StackingType::Diagonal => '#',
@@ -428,11 +428,76 @@ fn flatten_stack(st: &StackingData) -> String {
     flat
 }
 
+/// The visible text of a cell list, one character per slot: what an editor shows
+/// (a break is a newline, a stacking run is its flattened glyphs). This is the
+/// text an in-place editor puts in front of the user, while the cells keep the
+/// formatting that has to survive the edit.
+pub(crate) fn cells_text(cells: &[Cell]) -> String {
+    let mut text = String::new();
+    for cell in cells {
+        match cell {
+            Cell::Char(ch, _) => text.push(*ch),
+            Cell::Break(..) => text.push('\n'),
+            Cell::Stack { data, head, .. } => {
+                if *head {
+                    text.push_str(&flatten_stack(data));
+                }
+            }
+        }
+    }
+    text
+}
+
+/// Rewrite `cells` so it spells `text`, keeping the formatting of everything the
+/// edit left alone: the unchanged head and tail stay exactly as parsed, only the
+/// changed middle is replaced — with the formatting in force at the caret. This
+/// is what makes editing a cell that carries inline codes (a bold run, a font
+/// override) keep those codes instead of flattening the run to plain text.
+pub(crate) fn cells_set_text(
+    cells: &mut Vec<Cell>,
+    para0: &ParagraphProperties,
+    text: &str,
+) {
+    let old = cells_text(cells);
+    if old == text {
+        return;
+    }
+    let prefix = old
+        .chars()
+        .zip(text.chars())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let old_len = old.chars().count();
+    let new_len = text.chars().count();
+    let limit = old_len.min(new_len) - prefix;
+    let suffix = old
+        .chars()
+        .rev()
+        .zip(text.chars().rev())
+        .take(limit)
+        .take_while(|(a, b)| a == b)
+        .count();
+    let start = cells_delete_range(cells, prefix, old_len - suffix);
+    let inserted: String = text
+        .chars()
+        .skip(prefix)
+        .take(new_len - prefix - suffix)
+        .collect();
+    // A newline in the editor's own text is a paragraph break in the value.
+    let inserted = inserted.replace('\n', "\\P");
+    let props = insert_props(cells, start);
+    let para_props = para_props_at(para0, cells, start);
+    let mut inserted_cells = str_to_cells(&inserted, &props, &para_props);
+    let added = inserted_cells.len();
+    cells.splice(start..start, inserted_cells.drain(..));
+    fold_special_codes(cells, start, start + added);
+}
+
 /// Flatten a document into one cell per visible slot (same order + count as the
 /// layout's glyph boxes). This is the editor's caret index space. The first
 /// paragraph's properties are the implicit para-0 default (see [`doc_para0`]);
 /// each `Break` carries the properties of the paragraph it opens.
-fn doc_to_cells(doc: &MTextDocument) -> Vec<Cell> {
+pub(crate) fn doc_to_cells(doc: &MTextDocument) -> Vec<Cell> {
     let mut cells = Vec::new();
     for (pi, para) in doc.paragraphs.iter().enumerate() {
         if pi > 0 {
@@ -461,7 +526,7 @@ fn doc_to_cells(doc: &MTextDocument) -> Vec<Cell> {
 
 /// The first paragraph's properties (the para-0 default not carried by any
 /// `Break`), or the default for an empty document.
-fn doc_para0(doc: &MTextDocument) -> ParagraphProperties {
+pub(crate) fn doc_para0(doc: &MTextDocument) -> ParagraphProperties {
     doc.paragraphs
         .first()
         .map(|p| p.properties.clone())
@@ -472,7 +537,7 @@ fn doc_para0(doc: &MTextDocument) -> ParagraphProperties {
 /// properties coalesce into one span; a `Break` starts a new paragraph carrying
 /// its stored properties; a `Stack` run's head cell re-emits the stacking span.
 /// `para0` supplies the first paragraph's properties.
-fn cells_to_doc(para0: &ParagraphProperties, cells: &[Cell]) -> MTextDocument {
+pub(crate) fn cells_to_doc(para0: &ParagraphProperties, cells: &[Cell]) -> MTextDocument {
     let mut doc = MTextDocument::new();
     doc.paragraphs.clear();
     let mut para = MTextParagraph::new();
@@ -507,7 +572,7 @@ fn cells_to_doc(para0: &ParagraphProperties, cells: &[Cell]) -> MTextDocument {
 /// The paragraph properties in force at flat index `caret` — the last `Break`
 /// before it, or the para-0 default. Used so a newly inserted break clones the
 /// current paragraph's properties.
-fn para_props_at(para0: &ParagraphProperties, cells: &[Cell], caret: usize) -> ParagraphProperties {
+pub(crate) fn para_props_at(para0: &ParagraphProperties, cells: &[Cell], caret: usize) -> ParagraphProperties {
     let mut props = para0.clone();
     for cell in cells.iter().take(caret) {
         if let Cell::Break(p, _) = cell {
@@ -519,7 +584,7 @@ fn para_props_at(para0: &ParagraphProperties, cells: &[Cell], caret: usize) -> P
 
 /// Turn an inserted string (which may carry `\P` breaks) into cells, tagging
 /// every plain char with `span_props` and every break with `para_props`.
-fn str_to_cells(
+pub(crate) fn str_to_cells(
     s: &str,
     span_props: &SpanProperties,
     para_props: &ParagraphProperties,
@@ -541,7 +606,7 @@ fn str_to_cells(
 /// Replace each `%%d` / `%%p` / `%%c` that ends inside the freshly inserted
 /// `start..end` with its symbol (°, ±, ∅), as it is typed; returns the new end.
 /// The cells stay one per visible glyph, so the caret keeps matching the layout.
-fn fold_special_codes(cells: &mut Vec<Cell>, start: usize, mut end: usize) -> usize {
+pub(crate) fn fold_special_codes(cells: &mut Vec<Cell>, start: usize, mut end: usize) -> usize {
     let mut i = start.saturating_sub(2);
     while i + 3 <= end {
         if let [Cell::Char('%', props), Cell::Char('%', _), Cell::Char(c, _)] = &cells[i..i + 3] {
@@ -564,7 +629,7 @@ fn fold_special_codes(cells: &mut Vec<Cell>, start: usize, mut end: usize) -> us
 
 /// Properties newly-typed text at `caret` inherits — the cell to its left, or
 /// the default at the start of a paragraph / document.
-fn insert_props(cells: &[Cell], caret: usize) -> SpanProperties {
+pub(crate) fn insert_props(cells: &[Cell], caret: usize) -> SpanProperties {
     match caret.checked_sub(1).and_then(|i| cells.get(i)) {
         Some(Cell::Char(_, p)) | Some(Cell::Stack { props: p, .. }) => p.clone(),
         _ => SpanProperties::default(),
@@ -573,26 +638,13 @@ fn insert_props(cells: &[Cell], caret: usize) -> SpanProperties {
 
 /// Nudge an insertion index out of the interior of a stacking run (never split
 /// a fraction): step forward past any continuation cells.
-fn clamp_insert(cells: &[Cell], mut caret: usize) -> usize {
+pub(crate) fn clamp_insert(cells: &[Cell], mut caret: usize) -> usize {
     while caret < cells.len() && cells[caret].is_stack_cont() {
         caret += 1;
     }
     caret
 }
 
-/// True when the serialized MText value ends with a hard paragraph break —
-/// i.e. a trailing empty paragraph, which `parse_mtext` drops. `to_mtext_string`
-/// wraps multi-paragraph output in `{…}`, so strip a trailing `}` first, then
-/// require an ODD run of backslashes before a final `P` (an even run is an
-/// escaped literal `\\`, not the `\P` break code).
-fn content_has_trailing_break(raw: &str) -> bool {
-    let s = raw.trim_end();
-    let s = s.strip_suffix('}').unwrap_or(s);
-    match s.strip_suffix('P') {
-        Some(rest) => rest.chars().rev().take_while(|&c| c == '\\').count() % 2 == 1,
-        None => false,
-    }
-}
 
 /// Character class for double-click word selection: a word run, a whitespace
 /// run, or a paragraph break (each selects a maximal same-class run).
@@ -638,7 +690,7 @@ fn word_range(cells: &[Cell], off: usize) -> (usize, usize) {
 
 /// Delete cells `[a, b)`, first widening the range so it never cuts a stacking
 /// run in half. Returns the (possibly widened) start index — the new caret.
-fn cells_delete_range(cells: &mut Vec<Cell>, mut a: usize, mut b: usize) -> usize {
+pub(crate) fn cells_delete_range(cells: &mut Vec<Cell>, mut a: usize, mut b: usize) -> usize {
     let n = cells.len();
     a = a.min(n);
     b = b.clamp(a, n);
@@ -656,6 +708,7 @@ fn cells_delete_range(cells: &mut Vec<Cell>, mut a: usize, mut b: usize) -> usiz
 
 // ── App-side editor driver ──────────────────────────────────────────────────
 
+use crate::entities::text_support::ends_with_break;
 use crate::scene::convert::tessellate;
 use crate::scene::model::wire_model::WireModel;
 
@@ -851,7 +904,7 @@ impl super::OpenCADStudio {
         // (never committed) so the layout lays the line out and the caret gets a
         // box on it. Keyed off the current content — `ed.doc` is only re-synced
         // further down in this function, so it is still stale here.
-        if content_has_trailing_break(&ed.content.text()) {
+        if ends_with_break(&ed.content.text()) {
             match mt.value.rfind('}') {
                 Some(pos) => mt.value.insert(pos, ' '),
                 None => mt.value.push(' '),
@@ -897,7 +950,7 @@ impl super::OpenCADStudio {
             // the new line.
             let raw = ed.content.text();
             let mut d = parse_mtext(&raw, true);
-            if content_has_trailing_break(&raw) {
+            if ends_with_break(&raw) {
                 d.paragraphs.push(MTextParagraph::new());
             }
             ed.doc = d;
@@ -2171,11 +2224,11 @@ mod cell_tests {
 
     #[test]
     fn trailing_break_detection() {
-        assert!(content_has_trailing_break("{ab\\P}")); // braced (to_mtext_string form)
-        assert!(content_has_trailing_break("ab\\P")); // unbraced
-        assert!(!content_has_trailing_break("{a\\Pb}")); // break in the middle
-        assert!(!content_has_trailing_break("ab"));
-        assert!(!content_has_trailing_break("{x\\\\P}")); // escaped literal backslash + P
+        assert!(ends_with_break("{ab\\P}")); // braced (to_mtext_string form)
+        assert!(ends_with_break("ab\\P")); // unbraced
+        assert!(!ends_with_break("{a\\Pb}")); // break in the middle
+        assert!(!ends_with_break("ab"));
+        assert!(!ends_with_break("{x\\\\P}")); // escaped literal backslash + P
     }
 
     #[test]
@@ -2189,7 +2242,7 @@ mod cell_tests {
         let raw = cells_to_doc(&ParagraphProperties::default(), &cells).to_mtext_string();
         // rebuild() re-parses + restores the trailing empty paragraph.
         let mut d = parse_mtext(&raw, true);
-        if content_has_trailing_break(&raw) {
+        if ends_with_break(&raw) {
             d.paragraphs.push(MTextParagraph::new());
         }
         assert_eq!(

@@ -3325,6 +3325,10 @@ handles={handles_ms:.1} panel={:.1} ribbon={ribbon_ms:.1} tail={:.1} selected={}
             let columns = table.column_count().max(1);
             let index = self.tabs[i].properties.prop_vertex;
             let (row, column) = (index / columns, index % columns);
+            // The armed cell may be a member of a merged span: its text lives in
+            // the span's owner, so patching the member silently changed nothing on
+            // screen. Same mapping the in-place editor and TABLEDIT use.
+            let (row, column) = crate::entities::table::merged_owner_cell(table, row, column);
             let value = table.cell_text(row, column).unwrap_or_default().to_string();
             patched |= crate::entities::table::patch_block_cell_format(
                 &mut self.tabs[i].scene.document,
@@ -3344,7 +3348,7 @@ handles={handles_ms:.1} panel={:.1} ribbon={ribbon_ms:.1} tail={:.1} selected={}
             );
         }
         if patched {
-            self.tabs[i].scene.bump_geometry();
+            self.tabs[i].scene.bump_block_epoch();
         }
     }
 

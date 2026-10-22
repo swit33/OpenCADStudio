@@ -2840,6 +2840,37 @@ impl Scene {
         }
     }
 
+    /// The colour the active view actually clears its canvas with — what lies
+    /// behind everything drawn in it. An overlay that has to erase something
+    /// already on the canvas (the in-place table cell editor covering the text
+    /// the table drew) fills with this, not with a UI theme colour: anything
+    /// else leaves a visible patch.
+    pub(crate) fn canvas_clear_color(&self) -> [f32; 4] {
+        use codec::objects::{ClassObjectData, ObjectType};
+
+        if self.current_layout != "Model" {
+            // A table sits on the sheet, not on the desk around it.
+            return self.paper_bg_color;
+        }
+        let index = self.active_model_tile.get();
+        if let Some(value) = self.model_tile_vport(index) {
+            // A 2D wireframe view paints no background, as in the reference.
+            let flat = self.model_tiles.borrow().get(index).is_some_and(|tile| {
+                tile.render_mode == codec::entities::ViewportRenderMode::Wireframe2D
+            });
+            if !flat {
+                if let Some(ObjectType::ClassObject(object)) =
+                    self.document.objects.get(&value.background_handle)
+                {
+                    if let ClassObjectData::SolidBackground(background) = &object.data {
+                        return Self::packed_background_color(background.color);
+                    }
+                }
+            }
+        }
+        self.bg_color
+    }
+
     fn packed_background_color(color: u32) -> [f32; 4] {
         [
             ((color >> 16) & 0xff) as f32 / 255.0,

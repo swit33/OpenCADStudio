@@ -176,6 +176,13 @@ impl OpenCADStudio {
                 | CmdResult::SliceEntities { .. }
                 | CmdResult::SliceSurfaceEntities { .. }
         );
+        // Which command is ending, before the result clears it: TABLEDIT hands
+        // off to the in-place editor as its own result, so it must not be
+        // cancelled by the end-of-command bookkeeping below.
+        let finished_cmd = self.tabs[self.active_tab]
+            .active_cmd
+            .as_ref()
+            .map(|command| command.name().to_string());
         let task = self.apply_cmd_result_inner(result);
         let i = self.active_tab;
         // A transparent zoom that just finished hands control back to the
@@ -209,8 +216,14 @@ impl OpenCADStudio {
             self.command_line.clear_contextual_suggestions();
             self.restore_add_selected_defaults();
             self.tabs[i].pending_pause_tokens = None;
-            // The cell editor is over: drop the cell highlight with it.
-            self.table_cell_edit = None;
+            // The cell editor is over: drop the cell highlight with it, and put
+            // back the text it blanked (dropping it outright left the cell
+            // blank in the drawing). TABLEDIT is the exception — it opens the
+            // editor as its own result, so cancelling here would close the editor
+            // the user had just asked for.
+            if finished_cmd.as_deref() != Some("TABLEDIT") {
+                self.table_cell_cancel();
+            }
         }
         if self.tabs[i].active_cmd.is_some() && self.tabs[i].pending_pause_tokens.is_some() {
             let drain_task = self.drain_pending_pause_tokens(i);
@@ -298,18 +311,15 @@ impl OpenCADStudio {
         if hit.locked {
             return TableCellEditStart::LockedCell;
         }
-        self.table_cell_edit = Some(crate::modules::annotate::table_cmd::TableCellEditMark {
-            handle,
-            row: hit.row,
-            column: hit.column,
-        });
-        let command = crate::modules::annotate::table_cmd::TableCellEditCommand::new(
-            handle, &table, hit.row, hit.column,
-        );
-        self.command_line
-            .push_info(&crate::command::CadCommand::prompt(&command));
-        self.tabs[i].active_cmd = Some(Box::new(command));
-        TableCellEditStart::Started
+        // A merged span's text lives in its owner cell: a click may land on
+        // any member, the editor (and the commit) work on the owner.
+        let (row, column) = crate::entities::table::merged_owner_cell(&table, hit.row, hit.column);
+        // Open the in-place editor over the span's own screen rectangle.
+        let Some(rect) = crate::app::view::overlay::table_cell_edit_rect(self, handle, row, column)
+        else {
+            return TableCellEditStart::NoCell;
+        };
+        self.open_table_cell_edit(handle, row, column, rect)
     }
 
     /// Reports a refused command-line value and shows the prompt again.
@@ -920,14 +930,6 @@ impl OpenCADStudio {
                     return task;
                 }
             }
-            CmdResult::WriteTableCell {
-                handle,
-                row,
-                column,
-                text,
-            } => {
-                self.handle_write_table_cell(handle, row, column, text);
-            }
             CmdResult::MatchEntityLayer { dest, src } => {
                 self.handle_match_entity_layer(dest, src);
             }
@@ -1174,6 +1176,10 @@ impl OpenCADStudio {
         // the editor can handle them.
         let focus = if self.mtext_editor.is_some() {
             self.unfocus_widgets()
+        } else if self.table_cell_edit.is_some() && self.cell_keyboard {
+            // The cell owns the keyboard: keep it there unless the user has moved
+            // to the command line (then `cell_keyboard` is false).
+            crate::app::table_cell_edit::focus_sink()
         } else if self.text_inline.is_some() {
             // The in-place TEXT editor needs keyboard focus on its own field.
             iced::widget::operation::focus(iced::widget::Id::new(super::view::TEXT_INLINE_ID))
@@ -1525,43 +1531,6 @@ impl OpenCADStudio {
         None
     }
 
-    /// Write a cell's text and redraw only that cell in the table's baked
-    /// picture block. Editing content must not cost the table its authored
-    /// styling: the block is kept and one text is rewritten (see
-    /// `patch_block_cell_text`), and the whole edit lands in one undo step.
-    fn handle_write_table_cell(&mut self, handle: Handle, row: usize, column: usize, text: String) {
-        let i = self.active_tab;
-        if self.reject_locked_edit(i, handle) {
-            self.tabs[i].active_cmd = None;
-            return;
-        }
-        self.push_undo_snapshot(i, "TABLE CELL");
-        let doc = &mut self.tabs[i].scene.document;
-        if let Some(codec::EntityType::Table(table)) = doc.get_entity_mut(handle) {
-            if let Some(cell) = table.cell_mut(row, column) {
-                cell.set_text(&text);
-            }
-        }
-        let patched =
-            crate::entities::table::patch_block_cell_text(doc, handle, row, column, &text);
-        if !patched {
-            // A cell the picture block never drew has no text to rewrite:
-            // dropping the picture makes the table draw itself from the cells.
-            if let Some(codec::EntityType::Table(table)) = doc.get_entity_mut(handle) {
-                table.block_record_handle = None;
-            }
-        }
-        self.tabs[i]
-            .scene
-            .bump_entities(&[(handle, crate::scene::ChangeKind::Modified)]);
-        // A patched block keeps its entities: its cached geometry is what moved.
-        self.tabs[i].scene.bump_geometry();
-        self.tabs[i].dirty = true;
-        self.tabs[i].active_cmd = None;
-        self.tabs[i].snap_result = None;
-        self.refresh_properties();
-    }
-
     fn handle_delete_groups(&mut self, mut handles: Vec<Handle>) -> Option<Task<Message>> {
         let i = self.active_tab;
         handles.retain(|handle| !self.tabs[i].scene.is_layer_locked(*handle));
@@ -1631,7 +1600,9 @@ impl OpenCADStudio {
         }
 
         match self.begin_table_cell_edit(i, handle, point) {
-            TableCellEditStart::Started => {}
+            TableCellEditStart::Started => {
+                return Some(crate::app::table_cell_edit::focus_sink());
+            }
             TableCellEditStart::LockedCell => {
                 self.command_line
                     .push_error(crate::t!("The cell is content locked.").as_ref());

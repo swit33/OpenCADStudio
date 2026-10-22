@@ -52,19 +52,22 @@ fn table_axes(table: &Table) -> (Vec3, Vec3) {
     (h, down)
 }
 
-fn merged_owner_and_span(
+/// The merged range that the cell at (`row`, `column`) belongs to — as its
+/// owner or as a member — clamped to the grid, else the single cell. A member
+/// cell has no text of its own: the span's owner carries it.
+pub(crate) fn containing_cell_span(
     table: &Table,
     row: usize,
     column: usize,
-) -> Option<(usize, usize, usize, usize)> {
+) -> (usize, usize, usize, usize) {
     for range in &table.merged_ranges {
         if range.contains(row, column) {
-            return (row == range.top_row && column == range.left_col).then_some((
+            return (
                 range.top_row,
                 range.left_col,
                 range.bottom_row.min(table.rows.len().saturating_sub(1)),
                 range.right_col.min(table.columns.len().saturating_sub(1)),
-            ));
+            );
         }
     }
 
@@ -78,17 +81,28 @@ fn merged_owner_and_span(
                 .min(table.columns.len().saturating_sub(1));
             if row >= owner_row && row <= row_end && column >= owner_column && column <= column_end
             {
-                return (row == owner_row && column == owner_column).then_some((
-                    owner_row,
-                    owner_column,
-                    row_end,
-                    column_end,
-                ));
+                return (owner_row, owner_column, row_end, column_end);
             }
         }
     }
 
-    Some((row, column, row, column))
+    (row, column, row, column)
+}
+
+/// The cell whose contents a click on (`row`, `column`) edits: the owner of
+/// the merged span it lands in, else the cell itself.
+pub(crate) fn merged_owner_cell(table: &Table, row: usize, column: usize) -> (usize, usize) {
+    let (top, left, _, _) = containing_cell_span(table, row, column);
+    (top, left)
+}
+
+fn merged_owner_and_span(
+    table: &Table,
+    row: usize,
+    column: usize,
+) -> Option<(usize, usize, usize, usize)> {
+    let span = containing_cell_span(table, row, column);
+    (span.0 == row && span.1 == column).then_some(span)
 }
 
 pub(crate) fn style_for_property<'a>(
@@ -115,6 +129,33 @@ pub(crate) fn style_for_property<'a>(
         }
     }
     None
+}
+
+/// The name of the block a table's picture is drawn from, when it has one. The
+/// table renders as a block use, so a change to a cell's drawn text is a change
+/// to this block's definition — and only to it.
+pub(crate) fn picture_block_name(
+    document: &codec::CadDocument,
+    table_handle: codec::Handle,
+) -> Option<String> {
+    let table = match document.get_entity(table_handle) {
+        Some(codec::EntityType::Table(table)) => table,
+        _ => return None,
+    };
+    let record = table
+        .block_record_handle
+        .and_then(|handle| {
+            document
+                .block_records
+                .iter()
+                .find(|record| record.handle == handle)
+        })
+        .or_else(|| {
+            (!table.block_name.is_empty())
+                .then(|| document.block_records.get(table.block_name.as_str()))
+                .flatten()
+        })?;
+    (!record.name.is_empty()).then(|| record.name.clone())
 }
 
 /// Rewrite the text of one cell inside the table's baked picture block, in
@@ -170,6 +211,10 @@ pub(crate) fn patch_block_cell_format(
 ) -> bool {
     use codec::entities::table::CellStylePropertyFlags as P;
 
+    // TODO(tables): the stamp covers style, height, rotation and colour only — the
+    // text's margins and wrap width are not refreshed, so a style edit that
+    // changes them shows in the cell data and not in the drawn cell. Bringing them
+    // over is the same one-line push as `height`.
     let table = match document.get_entity(table_handle) {
         Some(codec::EntityType::Table(table)) => (**table).clone(),
         _ => return false,
@@ -241,6 +286,171 @@ pub(crate) fn patch_block_cell_format(
     }
 }
 
+/// The text format one cell's content is drawn with.
+pub(crate) struct CellTextFormat {
+    /// Resolved text style name (empty when the cell has none: draw the default).
+    pub style: String,
+    pub height: f64,
+    pub rotation: f64,
+    /// Width the text wraps in, inside the cell's own margins.
+    pub wrap_width: f64,
+    /// Where the run's attachment point sits in the cell, in cell-local
+    /// coordinates: x runs right from the cell's left edge, y runs down from
+    /// the cell's top edge (0 at the top, -height at the bottom), the frame the
+    /// surface maps onto the cell's on-screen rectangle.
+    pub anchor: (f64, f64),
+    /// Which point of the run `anchor` pins, from the cell's alignment.
+    pub attachment: codec::entities::AttachmentPoint,
+    /// The colour the run draws with: the content's own colour, else the cell
+    /// style chain, else the table style's row style — the renderer's order.
+    pub color: [f32; 4],
+}
+
+/// Resolve the format one cell's content is drawn with: text style, height,
+/// rotation and wrap width, through cell → row → column → table style. The live
+/// in-place editor lays its text out with exactly this, so typing looks like the
+/// committed cell.
+pub(crate) fn cell_content_text_format(
+    document: &codec::CadDocument,
+    table: &Table,
+    row: &codec::entities::table::TableRow,
+    row_index: usize,
+    column: usize,
+    cell: &codec::entities::table::TableCell,
+    content: &codec::entities::table::CellContent,
+) -> CellTextFormat {
+    use codec::entities::table::CellStylePropertyFlags as P;
+
+    // Content colour, in the renderer's precedence order.
+    let aci = |c: &codec::types::Color| -> [f32; 4] {
+        match c {
+            codec::types::Color::ByLayer | codec::types::Color::ByBlock => {
+                [0.0, 0.0, 0.0, 1.0]
+            }
+            _ => crate::scene::convert::tess_util::aci_to_rgba(c),
+        }
+    };
+    let row_role_style: Option<&codec::objects::RowCellStyle> = table
+        .table_style_handle
+        .and_then(|handle| {
+            document
+                .objects
+                .get(&handle)
+                .and_then(|object| match object {
+                    codec::objects::ObjectType::TableStyle(style) => Some(style),
+                    _ => None,
+                })
+        })
+        .map(|style| match table_row_kind(table, row_index) {
+            0 => &style.title_row_style,
+            1 => &style.header_row_style,
+            _ => &style.data_row_style,
+        });
+    let color = if !matches!(
+        content.color,
+        codec::types::Color::ByLayer | codec::types::Color::ByBlock
+    ) {
+        aci(&content.color)
+    } else if let Some(style) = style_for_property(table, row, column, cell, P::CONTENT_COLOR) {
+        aci(&style.content_color)
+    } else if let Some(style) = row_role_style {
+        aci(&style.text_color)
+    } else {
+        [0.0, 0.0, 0.0, 1.0]
+    };
+
+    let style = cell_text_style(document, table, row, column, cell, Some(content))
+        .and_then(|handle| {
+            document
+                .text_styles
+                .iter()
+                .find(|style| style.handle == handle)
+                .map(|style| style.name.clone())
+        })
+        .or_else(|| {
+            style_for_property(table, row, column, cell, P::TEXT_STYLE)
+                .map(|style| style.text_style_name.trim().to_string())
+                .filter(|name| !name.is_empty())
+        })
+        .unwrap_or_default();
+    let height = cell_text_height(table, row, column, cell, content).unwrap_or(0.18);
+    let rotation = style_for_property(table, row, column, cell, P::ROTATION)
+        .map(|style| style.rotation)
+        .unwrap_or(0.0);
+    // Margins follow the renderer: a resolved override, else half the text height.
+    let inset = |flag| {
+        style_for_property(table, row, column, cell, flag)
+            .map(|style| match flag {
+                P::MARGIN_LEFT => style.margin_left,
+                P::MARGIN_RIGHT => style.margin_right,
+                P::MARGIN_TOP => style.margin_top,
+                _ => style.margin_bottom,
+            })
+            .filter(|margin| *margin > 1.0e-6)
+            .unwrap_or_else(|| (height * 0.5).max(0.06))
+    };
+    // The cell's own span: a merged cell's run hangs inside the whole merged
+    // rectangle, not its owner's single grid slot.
+    let (_, left, bottom, right) = containing_cell_span(table, row_index, column);
+    let width: f64 = table
+        .columns
+        .iter()
+        .skip(left)
+        .take(right + 1 - left)
+        .map(|column| column.width)
+        .sum();
+    let height_world: f64 = table
+        .rows
+        .iter()
+        .skip(row_index)
+        .take(bottom + 1 - row_index)
+        .map(|row| row.height)
+        .sum();
+    // Alignment decides which cell corner (inside the margins) the run hangs
+    // from. Cell → row → column → table style, middle-centre by default.
+    let align = style_for_property(table, row, column, cell, P::ALIGNMENT)
+        .map(|style| style.alignment)
+        .filter(|align| (1..=9).contains(align))
+        .unwrap_or(5);
+    let slot = (align.clamp(1, 9) - 1) as usize;
+    let x = [
+        inset(P::MARGIN_LEFT),
+        width * 0.5,
+        width - inset(P::MARGIN_RIGHT),
+    ][slot % 3];
+    let y = [
+        -inset(P::MARGIN_TOP),
+        -height_world * 0.5,
+        -(height_world - inset(P::MARGIN_BOTTOM)),
+    ][slot / 3];
+    CellTextFormat {
+        style,
+        height,
+        rotation,
+        wrap_width: (width - inset(P::MARGIN_LEFT) - inset(P::MARGIN_RIGHT)).max(0.05),
+        anchor: (x, y),
+        attachment: attachment_of(align),
+        color,
+    }
+}
+
+/// The attachment point that pins a run against `align` (1 top-left … 9
+/// bottom-right), matching how the picture block classifies cell alignment.
+fn attachment_of(align: i32) -> codec::entities::AttachmentPoint {
+    use codec::entities::AttachmentPoint as A;
+    match align {
+        1 => A::TopLeft,
+        2 => A::TopCenter,
+        3 => A::TopRight,
+        4 => A::MiddleLeft,
+        6 => A::MiddleRight,
+        7 => A::BottomLeft,
+        8 => A::BottomCenter,
+        9 => A::BottomRight,
+        _ => A::MiddleCenter,
+    }
+}
+
 /// The role a row plays in its table style (0 title, 1 header, 2 data) — the
 /// same classification the picture block's bake follows.
 fn table_row_kind(table: &Table, row: usize) -> usize {
@@ -270,6 +480,10 @@ pub(crate) fn patch_tables_using_style(
     document: &mut codec::CadDocument,
     style_handle: codec::Handle,
 ) -> Vec<codec::Handle> {
+    // TODO(tables): every `patch_block_cell_format` clones its own table to read
+    // the cell, so a style edit is O(cells) full clones of the drawing's tables —
+    // fine for a rare action, noticeable on a 50×20 table. Resolve the cell by
+    // handle once per table if this starts showing up in profiles.
     let style = match document.objects.get(&style_handle) {
         Some(codec::objects::ObjectType::TableStyle(style)) => style.clone(),
         _ => return Vec::new(),
@@ -306,7 +520,7 @@ pub(crate) fn patch_tables_using_style(
 
 /// The block text that draws one cell, or `None` when the block does not hold
 /// it (an empty cell the picture never drew).
-fn block_cell_text_target(
+pub(crate) fn block_cell_text_target(
     document: &codec::CadDocument,
     table_handle: codec::Handle,
     row: usize,
@@ -362,18 +576,27 @@ fn block_cell_text_target(
     // row below the first is negative in a block this app baked. A block baked
     // by another application may use either sign — compare magnitudes.
     const EPS: f64 = 1.0e-6;
-    block
-        .entity_handles
-        .iter()
-        .copied()
-        .find(|handle| match document.get_entity(*handle) {
-            Some(codec::EntityType::MText(text)) => {
-                let x = text.insertion_point.x;
-                let y = text.insertion_point.y.abs();
-                x >= x0 - EPS && x <= x1 + EPS && y >= y0 - EPS && y <= y1 + EPS
-            }
-            _ => false,
-        })
+    // Several texts can fall in one band (a right-aligned cell with no margins
+    // puts another cell's text on its edge, a merged region holds a neighbour's
+    // label). Take the one nearest the cell's middle instead of the first in
+    // handle order, which is arbitrary and picked the wrong text on a boundary.
+    let (mid_x, mid_y) = ((x0 + x1) * 0.5, (y0 + y1) * 0.5);
+    let mut best: Option<(f64, codec::Handle)> = None;
+    for handle in block.entity_handles.iter().copied() {
+        let Some(codec::EntityType::MText(text)) = document.get_entity(handle) else {
+            continue;
+        };
+        let x = text.insertion_point.x;
+        let y = text.insertion_point.y.abs();
+        if x < x0 - EPS || x > x1 + EPS || y < y0 - EPS || y > y1 + EPS {
+            continue;
+        }
+        let distance = (x - mid_x).powi(2) + (y - mid_y).powi(2);
+        if best.is_none_or(|(best_distance, _)| distance < best_distance) {
+            best = Some((distance, handle));
+        }
+    }
+    best.map(|(_, handle)| handle)
 }
 
 /// A cell's text height: the content's own format when it overrides it,

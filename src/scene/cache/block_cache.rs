@@ -170,6 +170,14 @@ pub struct BlockDefn {
 pub struct BlockCache {
     defns: HashMap<String, Arc<BlockDefn>>,
     prototype_blocks: HashSet<String>,
+    /// The inputs this cache was built with. Kept so ONE block's definition can
+    /// be rebuilt in place (`rebuild_defn`) instead of re-walking every block in
+    /// the drawing — editing one table cell used to cost a full rebuild.
+    anno_scale: f32,
+    annotation_scale_handle: Option<Handle>,
+    all_visible: bool,
+    bg_color: [f32; 4],
+    viewport: Option<Handle>,
     /// Fully expanded prototype for repeated, non-array inserts. The key omits
     /// translation but includes the linear transform and every inherited style
     /// input. A matching insert therefore reuses all nested expansion/style
@@ -223,6 +231,58 @@ impl BlockCache {
         Self::default()
     }
 
+    /// Rebuild ONE block's definition, reusing every other definition (and the
+    /// expansion prototypes of other blocks) from this cache.
+    ///
+    /// A block's definition is what a table's picture is drawn from, so editing a
+    /// cell has to refresh it. Rebuilding the whole cache for that re-walks every
+    /// block in the drawing — 170 ms on a real sheet, on every keystroke-commit and
+    /// every editor open — while the block that actually changed costs a fraction
+    /// of it. The caller is responsible for invalidating the entities that use
+    /// the block.
+    pub fn rebuild_defn(
+        &self,
+        doc: &CadDocument,
+        block_name: &str,
+        depth_map: &HashMap<u64, [f32; 2]>,
+    ) -> Self {
+        let mut cache = Self {
+            defns: self.defns.clone(),
+            prototype_blocks: self.prototype_blocks.clone(),
+            anno_scale: self.anno_scale,
+            annotation_scale_handle: self.annotation_scale_handle,
+            all_visible: self.all_visible,
+            bg_color: self.bg_color,
+            viewport: self.viewport,
+            expansion_prototypes: std::sync::Mutex::new(
+                self.expansion_prototypes
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .iter()
+                    // An expansion prototype holds a block's fully expanded
+                    // geometry: only the changed block's must go.
+                    .filter(|(key, _)| !key.block_name.eq_ignore_ascii_case(block_name))
+                    .map(|(key, value)| (key.clone(), Arc::clone(value)))
+                    .collect(),
+            ),
+            clip_prototypes: std::sync::Mutex::new(HashMap::default()),
+            cycle_warnings: std::sync::Mutex::new(HashSet::default()),
+        };
+        let rebuilt = Arc::new(build_defn(
+            doc,
+            block_name,
+            self.anno_scale,
+            self.annotation_scale_handle,
+            self.all_visible,
+            self.bg_color,
+            self.viewport,
+            depth_map,
+        ));
+        cache.defns.insert(block_name.to_string(), rebuilt);
+        cache.compute_block_metrics(&[block_name.to_string()]);
+        cache
+    }
+
     pub fn record_cycle_warning(&self, block_name: &str) -> bool {
         let mut warnings = self
             .cycle_warnings
@@ -263,6 +323,11 @@ impl BlockCache {
     ) -> Self {
         use crate::par::prelude::*;
         let mut cache = Self::new();
+        cache.anno_scale = anno_scale;
+        cache.annotation_scale_handle = annotation_scale_handle;
+        cache.all_visible = all_visible;
+        cache.bg_color = bg_color;
+        cache.viewport = viewport;
         let referenced = collect_referenced_blocks(doc, anno_scale);
         let mut reference_counts: HashMap<String, usize> = HashMap::default();
         for entity in doc.entities() {
@@ -318,6 +383,11 @@ impl BlockCache {
     ) -> Self {
         use crate::par::prelude::*;
         let mut cache = Self::new();
+        cache.anno_scale = anno_scale;
+        cache.annotation_scale_handle = annotation_scale_handle;
+        cache.all_visible = all_visible;
+        cache.bg_color = bg_color;
+        cache.viewport = viewport;
         let referenced = referenced_block_tree(doc, block_name, anno_scale);
         cache.defns = referenced
             .par_iter()

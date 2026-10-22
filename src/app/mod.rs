@@ -58,6 +58,7 @@ pub(crate) mod settings;
 mod shortcuts;
 mod startup;
 pub(crate) mod style_ops;
+mod table_cell_edit;
 #[cfg(test)]
 mod table_edit_tests;
 mod text_inline;
@@ -1372,9 +1373,19 @@ pub(super) struct OpenCADStudio {
     pending_command_editor_text: Option<String>,
     /// Open in-place single-line TEXT editor (plain text-entry box), if any.
     text_inline: Option<text_inline::TextInlineState>,
-    /// Cell the open table cell editor is working on. The viewport highlights
-    /// it so the edit reads as attached to a cell, not just to a prompt.
-    table_cell_edit: Option<crate::modules::annotate::table_cmd::TableCellEditMark>,
+    /// Open in-place table cell editor, if any: the edited text, its caret and
+    /// the live layout the surface draws over the cell.
+    table_cell_edit: Option<table_cell_edit::TableCellEditState>,
+    /// Who owns the keyboard while a cell is being edited: the cell (true) or the
+    /// command line (false). Set by what the user last touched — opening the cell
+    /// or clicking its text claims it, typing into the command line releases it —
+    /// so the capture is a real focus choice instead of a blanket lock.
+    cell_keyboard: bool,
+    /// Whether Shift is held right now. The cell editor needs it because iced's
+    /// text editor reports Enter the same way with or without Shift, while the
+    /// two mean different things here: Enter commits the cell, Shift+Enter types
+    /// a line break.
+    table_cell_shift: bool,
     /// Cursor-anchored one-shot snap override menu (Shift+RMB): the canvas
     /// point it opened at, or `None` when closed (#337).
     snap_override_popup: Option<iced::Point>,
@@ -4255,6 +4266,15 @@ pub enum Message {
     MTextCaretBlink,
     /// Commit the editor: create or update the MText entity.
     MTextOk,
+    /// One action from the in-place table cell editor's keystroke sink.
+    TableCellEditAction(iced::widget::text_editor::Action),
+    /// A click on the cell editor's surface, as a slot index (the glyph boxes'
+    /// own numbering): moves the sink's caret without stealing its focus.
+    TableCellSelStart(usize),
+    TableCellSelTo(usize),
+    /// Shift went down or up — the cell editor needs it to tell Enter (commit)
+    /// from Shift+Enter (line break).
+    TableCellShift(bool),
     /// Apply the buffer to the entity but leave the editor open (the button).
     MTextApply,
     /// Grab the resizable modal's corner grip (a drag resizes it).
@@ -5172,6 +5192,8 @@ impl OpenCADStudio {
             pending_command_editor_text: None,
             text_inline: None,
             table_cell_edit: None,
+            cell_keyboard: false,
+            table_cell_shift: false,
             snap_override_popup: None,
             axis_lock_dir: None,
             angle_override: None,

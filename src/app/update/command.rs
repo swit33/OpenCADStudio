@@ -218,6 +218,10 @@ impl OpenCADStudio {
         // editor holds a document-local handle into one tab, so drop it
         // now rather than risk it applying to a different tab's document.
         self.cancel_attr_editor();
+        // The cell editor holds the same kind of document-local handle, and it
+        // keeps its cell's text blanked in that tab's picture block: cancel it
+        // (restoring the text) before the tab can go away.
+        self.table_cell_cancel();
         if self.tabs.get(idx).map_or(false, |t| t.dirty) {
             self.pending_close = Some(crate::app::PendingClose::Tab(self.tabs[idx].id));
             return self.open_unsaved_dialog_window();
@@ -1295,6 +1299,11 @@ impl OpenCADStudio {
         // The in-place TEXT editor likewise cancels on Escape.
         if self.text_inline.is_some() {
             self.text_inline_cancel();
+            return self.post_editor_closed(false);
+        }
+        // ...as does the in-place table cell editor.
+        if self.table_cell_edit.is_some() {
+            self.table_cell_cancel();
             return self.post_editor_closed(false);
         }
         // Esc cancels an armed pane move.

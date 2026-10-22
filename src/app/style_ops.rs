@@ -965,7 +965,7 @@ impl OpenCADStudio {
                     .map(|handle| (*handle, crate::scene::ChangeKind::Modified))
                     .collect();
                 self.tabs[i].scene.bump_entities(&changes);
-                self.tabs[i].scene.bump_geometry();
+                self.tabs[i].scene.bump_block_epoch();
             }
 
             for style in changed_mleader_styles {
